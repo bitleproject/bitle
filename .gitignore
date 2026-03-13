@@ -1,0 +1,37 @@
+# ESP-IDF build output
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+*.ninja
+.ninja_log
+.ninja_deps
+
+# ESP-IDF configuration artifacts
+sdkconfig
+sdkconfig.old
+sdkconfig.*.backup
+sdkconfig.*.old
+dependencies.lock
+
+# Flash images and intermediate binaries
+*.bin
+*.elf
+*.map
+flash_args
+partition_table/
+bootloader/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE/editor metadata
+.vscode/
+.idea/
+.DS_Store
+
+# Logs and scratch
+*.log
+
+

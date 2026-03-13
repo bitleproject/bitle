@@ -1,0 +1,41 @@
+idf_component_register(
+    SRCS
+        src/protocol/cipherstate.c
+        src/protocol/dhstate.c
+        src/protocol/handshakestate.c
+        src/protocol/hashstate.c
+        src/protocol/internal.c
+        src/protocol/names.c
+        src/protocol/patterns.c
+        src/protocol/randstate.c
+        src/protocol/signstate.c
+        src/protocol/symmetricstate.c
+        src/protocol/util.c
+        src/protocol/rand_esp32.c
+        src/backend/ref/cipher-aesgcm.c
+        src/backend/ref/cipher-chachapoly.c
+        src/backend/ref/dh-curve25519.c
+        src/backend/ref/hash-blake2b.c
+        src/backend/ref/hash-blake2s.c
+        src/backend/ref/hash-sha256.c
+        src/backend/ref/hash-sha512.c
+        src/backend/ref/sign-ed25519.c
+        src/crypto/aes/rijndael-alg-fst.c
+        src/crypto/blake2/blake2b.c
+        src/crypto/blake2/blake2s.c
+        src/crypto/chacha/chacha.c
+        src/crypto/donna/curve25519-donna.c
+        src/crypto/donna/poly1305-donna.c
+        src/crypto/ed25519/ed25519.c
+        src/crypto/sha2/sha256.c
+        src/crypto/sha2/sha512.c
+        src/crypto/ghash/ghash.c
+    INCLUDE_DIRS include src src/protocol src/backend/ref src/crypto src/crypto/donna src/crypto/ed25519 src/crypto/chacha src/crypto/sha2 src/crypto/blake2 src/crypto/aes src/crypto/ghash
+    REQUIRES
+)
+
+set_source_files_properties(
+    src/crypto/ed25519/ed25519.c
+    PROPERTIES
+        COMPILE_FLAGS "-DED25519_CUSTOMRANDOM -DED25519_CUSTOMHASH"
+)

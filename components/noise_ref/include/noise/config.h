@@ -1,0 +1,7 @@
+#ifndef NOISE_CONFIG_H
+#define NOISE_CONFIG_H
+
+#define NOISE_USE_LIBSODIUM 0
+#define NOISE_USE_OPENSSL 0
+
+#endif /* NOISE_CONFIG_H */
