@@ -76,7 +76,7 @@ void noise_init_helper(void)
 /**@{*/
 
 /**
- * \fn noise_init()
+ * \fn noise_ref_init()
  * \brief Initializes the Noise-c library.
  *
  * \return NOISE_ERROR_NONE on success.
@@ -84,7 +84,7 @@ void noise_init_helper(void)
  * This will initialize the underlying crypto libraries.
  * You don't need to call this if you initialize the crypto libraries (eg. libsodium, OpenSSL) yourself.
  */
-int noise_init(void)
+int noise_ref_init(void)
 {
 #if HAVE_PTHREAD
     if (pthread_once(&noise_is_initialized, noise_init_helper) != 0)

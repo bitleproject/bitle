@@ -26,7 +26,7 @@
 #include "noise/protocol/cipherstate.h"
 #include "noise/protocol/buffer.h"
 #include "noise/protocol/errors.h"
-#include "mbedtls/sha256.h"
+#include "psa/crypto.h"
 #include "ed25519.h"
 
 #define NOISE_STATIC_KEY_NS       "noise"
@@ -161,7 +161,8 @@ static void load_identity(void)
             size_t pub_len = noise_dhstate_get_public_key_length(dh);
             if (pub_len == sizeof(s_static_public) && noise_dhstate_get_public_key(dh, s_static_public, pub_len) == NOISE_ERROR_NONE) {
                 uint8_t hash[32];
-                mbedtls_sha256(s_static_public, sizeof(s_static_public), hash, 0);
+                size_t hash_len;
+                psa_hash_compute(PSA_ALG_SHA_256, s_static_public, sizeof(s_static_public), hash, sizeof(hash), &hash_len);
                 memcpy(s_peer_id, hash, sizeof(s_peer_id));
                 nvs_set_blob(handle, NOISE_PEER_ID_KEY, s_peer_id, sizeof(s_peer_id));
             }
