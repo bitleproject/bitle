@@ -11,7 +11,10 @@ extern "C" {
 #endif
 
 #define NOISE_HANDSHAKE_TASK_PRIORITY    (tskIDLE_PRIORITY + 3)
-#define NOISE_HANDSHAKE_TASK_STACK_WORDS 8192
+/* 12 KB: the courier hand-off path nests several 520-byte packet buffers
+ * (store read -> envelope encode -> packet encode -> sign -> canonicalize)
+ * on top of announce processing. 8 KB overflowed under a real deposit. */
+#define NOISE_HANDSHAKE_TASK_STACK_WORDS 12288
 
 typedef enum {
     BITCHAT_MSG_ANNOUNCE = 0x01,

@@ -350,14 +350,17 @@ void bitle_courier_peer_announced(uint16_t conn_handle, const uint8_t peer_id[8]
     uint8_t tags[3][TAG_LEN];
     candidate_tags(noise_key, now_ms, tags);
 
-    announce_ctx_t ctx = {
-        .conn_handle = conn_handle,
-        .peer_id = peer_id,
-        .tags = (const uint8_t (*)[TAG_LEN])tags,
-        .is_direct = is_direct,
-        .verified = verified,
-        .now_ms = now_ms,
-    };
+    /* announce_ctx_t carries up to 6 x 520-byte deferred spray buffers
+     * (~3.3 KB). Keep it OFF the noise worker's ~8 KB stack — the worker is
+     * single-threaded so a file-scope instance is safe and reused. */
+    static announce_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.conn_handle = conn_handle;
+    ctx.peer_id = peer_id;
+    ctx.tags = (const uint8_t (*)[TAG_LEN])tags;
+    ctx.is_direct = is_direct;
+    ctx.verified = verified;
+    ctx.now_ms = now_ms;
     bitle_store_iterate(announce_iter, &ctx);
     /* Apply deferred store mutations now that iteration has released the
      * store lock and is no longer walking the index. */
