@@ -16,15 +16,31 @@
 
 static const char *TAG = "nickname";
 
+#define NICKNAME_PREFIX     "Bitle-"
+#define NICKNAME_PREFIX_LEN 6
+#define NICKNAME_DET_LEN    (NICKNAME_PREFIX_LEN + 4)  /* "Bitle-1234" */
+
 static bool nickname_is_deterministic(const char *nickname)
 {
-    if (!nickname) {
+    if (!nickname || strlen(nickname) != NICKNAME_DET_LEN) {
         return false;
     }
-    if (strlen(nickname) != 8) {
+    if (strncmp(nickname, NICKNAME_PREFIX, NICKNAME_PREFIX_LEN) != 0) {
         return false;
     }
-    if (strncmp(nickname, "anon", 4) != 0) {
+    for (int i = NICKNAME_PREFIX_LEN; i < NICKNAME_DET_LEN; ++i) {
+        if (nickname[i] < '0' || nickname[i] > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Old default ("anon1234"). Detected so an OTA/reflash migrates a node to the
+ * branded name without a factory erase — the identity keypair is untouched. */
+static bool nickname_is_legacy_anon(const char *nickname)
+{
+    if (!nickname || strlen(nickname) != 8 || strncmp(nickname, "anon", 4) != 0) {
         return false;
     }
     for (int i = 4; i < 8; ++i) {
@@ -69,12 +85,12 @@ static uint16_t nickname_suffix_from_peer_id(const uint8_t *peer_id, size_t len)
 
 static void nickname_generate(char *out_nickname, size_t max_len)
 {
-    if (!out_nickname || max_len < 9) {
+    if (!out_nickname || max_len < NICKNAME_DET_LEN + 1) {
         return;
     }
     const uint8_t *peer_id = noise_get_local_peer_id();
     uint16_t suffix = nickname_suffix_from_peer_id(peer_id, 8);
-    snprintf(out_nickname, max_len, "anon%04u", (unsigned)suffix);
+    snprintf(out_nickname, max_len, NICKNAME_PREFIX "%04u", (unsigned)suffix);
 }
 
 static esp_err_t nickname_store(const char *nickname)
@@ -116,14 +132,16 @@ esp_err_t nickname_init(char *out_nickname, size_t max_len)
     nvs_close(handle);
 
     if (err == ESP_OK) {
-        if (nickname_is_custom_valid(out_nickname)) {
+        if (nickname_is_legacy_anon(out_nickname)) {
+            ESP_LOGW(TAG, "Migrating legacy nickname %s to " NICKNAME_PREFIX "####", out_nickname);
+            /* fall through to regenerate with the branded name */
+        } else if (nickname_is_custom_valid(out_nickname)) {
             ESP_LOGI(TAG, "Loaded nickname: %s", out_nickname);
             return ESP_OK;
-        }
-        if (nickname_is_deterministic(out_nickname)) {
+        } else if (nickname_is_deterministic(out_nickname)) {
             const uint8_t *peer_id = noise_get_local_peer_id();
             uint16_t expected = nickname_suffix_from_peer_id(peer_id, 8);
-            uint16_t stored = (uint16_t)strtol(out_nickname + 4, NULL, 10);
+            uint16_t stored = (uint16_t)strtol(out_nickname + NICKNAME_PREFIX_LEN, NULL, 10);
             if (stored == expected) {
                 ESP_LOGI(TAG, "Loaded nickname: %s", out_nickname);
                 return ESP_OK;
@@ -132,15 +150,13 @@ esp_err_t nickname_init(char *out_nickname, size_t max_len)
         } else {
             ESP_LOGW(TAG, "Nickname in NVS not printable, regenerating");
         }
-    }
-
-    if (err != ESP_ERR_NVS_NOT_FOUND) {
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
         ESP_LOGW(TAG, "Invalid nickname in NVS or read error, regenerating");
     }
 
     nickname_generate(out_nickname, max_len);
     if (!nickname_is_deterministic(out_nickname)) {
-        strcpy(out_nickname, "anon0000");
+        strcpy(out_nickname, NICKNAME_PREFIX "0000");
     }
     nickname_store(out_nickname);
     return ESP_OK;
@@ -162,7 +178,7 @@ esp_err_t nickname_regenerate(char *out_nickname, size_t max_len)
     }
     nickname_generate(out_nickname, max_len);
     if (!nickname_is_deterministic(out_nickname)) {
-        strcpy(out_nickname, "anon0000");
+        strcpy(out_nickname, NICKNAME_PREFIX "0000");
     }
     return nickname_store(out_nickname);
 }

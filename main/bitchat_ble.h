@@ -11,6 +11,8 @@ extern "C" {
 #endif
 
 #define BITCHAT_BLE_MAX_PACKET_SIZE 520
+/* messageTTLDefault upstream; a packet still at this TTL arrived directly. */
+#define BITLE_ORIGIN_TTL 7
 
 esp_err_t bitchat_ble_init(void);
 esp_err_t bitchat_ble_start(void);

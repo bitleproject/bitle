@@ -16,7 +16,9 @@
 
 #include "bitchat_ble.h"
 #include "bitchat_time.h"
+#include "bitle_courier.h"
 #include "bitle_ota.h"
+#include "bitle_sync.h"
 #include "nickname_manager.h"
 #include "packet_codec.h"
 
@@ -43,7 +45,7 @@
 #define NOISE_MAX_SESSIONS        CONFIG_BT_NIMBLE_MAX_CONNECTIONS
 #define NOISE_QUEUE_DEPTH         12
 #define NOISE_MESSAGE_MAX         256
-#define NOISE_EVENT_PAYLOAD_MAX   320
+#define NOISE_EVENT_PAYLOAD_MAX   456
 #define NOISE_PACKET_TTL          7
 #define NOISE_MAX_ENCRYPTED_PAYLOAD 320
 #define ANNOUNCE_INTERVAL_MS      (10 * 1000ULL)
@@ -87,6 +89,8 @@ typedef struct {
 typedef struct {
     bool valid;
     bool verified;              /* Ed25519 packet signature checked out */
+    bool is_infra;              /* Bitle TLV 0xB1 bit0: dedicated relay node */
+    bool is_authoritative;      /* 0xB1 bit1: clock traces to a phone */
     uint64_t timestamp_ms;
     uint32_t fw_version;        /* Bitle TLV 0xB0; 0 for phones/older nodes */
     uint8_t nickname_len;
@@ -105,6 +109,8 @@ typedef struct {
     uint64_t timestamp_ms;
     uint8_t ttl;
     bool has_signature;
+    bool has_recipient;
+    uint8_t recipient_id[8];
     uint8_t signature[64];
     uint8_t peer_id[8];
     uint8_t payload[NOISE_EVENT_PAYLOAD_MAX];
@@ -152,6 +158,8 @@ static void process_announce_event(const noise_event_t *evt);
 static void process_identity_event(const noise_event_t *evt);
 static void process_encrypted_event(const noise_event_t *evt);
 static void process_subscribed_event(const noise_event_t *evt);
+static void process_courier_event(const noise_event_t *evt);
+static void process_sync_event(const noise_event_t *evt);
 static bool send_announce(noise_session_t *session);
 static esp_err_t encode_and_send(uint16_t conn_handle, bitchat_message_type_t type, const uint8_t *recipient_id, const uint8_t *payload, size_t payload_len, bool sign);
 static esp_err_t queue_event(const noise_event_t *evt, TickType_t wait_ticks);
@@ -206,7 +214,7 @@ static void load_identity(void)
 static void load_nickname(void)
 {
     if (nickname_init(s_nickname, sizeof(s_nickname)) != ESP_OK) {
-        strlcpy(s_nickname, "anon0000", sizeof(s_nickname));
+        strlcpy(s_nickname, "Bitle-0000", sizeof(s_nickname));
     }
 }
 
@@ -639,6 +647,15 @@ static bool build_announce_payload(uint8_t *buffer, size_t buffer_len, size_t *o
     buffer[offset++] = (BITLE_FW_VERSION >> 8) & 0xFF;
     buffer[offset++] = BITLE_FW_VERSION & 0xFF;
 
+    /* Infrastructure-role marker (TLV 0xB1, one flags byte, bit0 = dedicated
+     * relay node). Stable, self-describing hook for a future BitChat client
+     * that collapses infrastructure peers into a single "mesh · N relays"
+     * row. Purely cosmetic by contract: it must never grant capabilities, so
+     * forging it earns an attacker nothing. Absent-safe: old clients skip it. */
+    buffer[offset++] = 0xB1;
+    buffer[offset++] = 1;
+    buffer[offset++] = 0x01 | (bitchat_time_is_authoritative() ? 0x02 : 0x00);
+
     *out_len = offset;
     return true;
 }
@@ -944,6 +961,12 @@ static bool parse_announce_tlv(const uint8_t *payload, size_t len, noise_identit
                                      ((uint32_t)value[2] << 8) | value[3];
             }
             break;
+        case 0xB1:
+            if (tlv_len >= 1) {
+                record->is_infra = (value[0] & 0x01) != 0;
+                record->is_authoritative = (value[0] & 0x02) != 0;
+            }
+            break;
         default:
             break;
         }
@@ -1235,9 +1258,13 @@ static bool enqueue_packet_event(noise_evt_type_t type, uint16_t conn_handle, co
         .timestamp_ms = packet->timestamp_ms,
         .ttl = packet->ttl,
         .has_signature = packet->has_signature,
+        .has_recipient = packet->has_recipient,
         .payload_len = packet->payload_len,
     };
     memcpy(evt.peer_id, packet->sender_id, sizeof(evt.peer_id));
+    if (packet->has_recipient) {
+        memcpy(evt.recipient_id, packet->recipient_id, sizeof(evt.recipient_id));
+    }
     if (packet->has_signature) {
         memcpy(evt.signature, packet->signature, sizeof(evt.signature));
     }
@@ -1300,6 +1327,12 @@ static void handshake_task(void *arg)
             case NOISE_EVT_SUBSCRIBED:
                 process_subscribed_event(&evt);
                 break;
+            case NOISE_EVT_COURIER:
+                process_courier_event(&evt);
+                break;
+            case NOISE_EVT_SYNC:
+                process_sync_event(&evt);
+                break;
             case NOISE_EVT_DISCONNECT: {
                 noise_session_t *session = find_session(evt.conn_handle);
                 if (session) {
@@ -1353,6 +1386,16 @@ void noise_handle_announce(uint16_t conn_handle, const bitchat_packet_t *packet)
     enqueue_packet_event(NOISE_EVT_ANNOUNCE, conn_handle, packet);
 }
 
+void noise_handle_courier(uint16_t conn_handle, const bitchat_packet_t *packet)
+{
+    enqueue_packet_event(NOISE_EVT_COURIER, conn_handle, packet);
+}
+
+void noise_handle_request_sync(uint16_t conn_handle, const bitchat_packet_t *packet)
+{
+    enqueue_packet_event(NOISE_EVT_SYNC, conn_handle, packet);
+}
+
 void noise_handle_encrypted(uint16_t conn_handle, const bitchat_packet_t *packet)
 {
     enqueue_packet_event(NOISE_EVT_ENCRYPTED, conn_handle, packet);
@@ -1389,6 +1432,18 @@ static void process_announce_event(const noise_event_t *evt)
              * lets a freshly OTA'd image cancel its rollback window. */
             bitle_ota_mark_healthy();
             bitle_ota_peer_version_seen(conn_handle, evt->peer_id, ident.fw_version);
+            /* Courier mail keyed to this peer's noise static key: deliver
+             * (direct), flood one copy (relayed owner), or spray carriers. */
+            bitle_courier_peer_announced(conn_handle, evt->peer_id, ident.noise_key,
+                                         true, is_direct, bitchat_time_now_ms());
+            /* Authoritative clock source: a phone (no 0xB1) is the time
+             * authority and may correct even a wrong synced clock; an
+             * authoritative Bitle propagates real time hop-by-hop. Only
+             * direct announces carry a trustworthy first-hop timestamp. */
+            if (is_direct) {
+                bitchat_time_consider_peer_announce(evt->timestamp_ms,
+                                                    ident.is_infra, ident.is_authoritative);
+            }
         }
         if (is_direct) {
             noise_session_t *session = alloc_session(conn_handle);
@@ -1496,6 +1551,61 @@ static void process_encrypted_event(const noise_event_t *evt)
         return;
     }
     handle_noise_payload(evt->conn_handle, evt, session, plaintext, plaintext_len);
+}
+
+/* Reconstructs the wire packet from an event so signatures can be verified
+ * on the worker task (canonical bytes need every signed header field). */
+static void event_to_packet(const noise_event_t *evt, uint8_t type, bitchat_packet_t *pkt)
+{
+    memset(pkt, 0, sizeof(*pkt));
+    pkt->version = 1;
+    pkt->type = type;
+    pkt->ttl = evt->ttl;
+    pkt->timestamp_ms = evt->timestamp_ms;
+    memcpy(pkt->sender_id, evt->peer_id, sizeof(pkt->sender_id));
+    if (evt->has_recipient) {
+        pkt->has_recipient = true;
+        memcpy(pkt->recipient_id, evt->recipient_id, sizeof(pkt->recipient_id));
+    }
+    pkt->payload = (uint8_t *)evt->payload;
+    pkt->payload_len = evt->payload_len;
+    pkt->has_signature = evt->has_signature;
+    if (evt->has_signature) {
+        memcpy(pkt->signature, evt->signature, sizeof(pkt->signature));
+    }
+}
+
+static void process_courier_event(const noise_event_t *evt)
+{
+    noise_session_t *session = find_session(evt->conn_handle);
+    if (!session) {
+        return;
+    }
+    /* Deposits must arrive on the direct link from their claimed sender. */
+    if (memcmp(session->peer_id, evt->peer_id, sizeof(session->peer_id)) != 0) {
+        ESP_LOGI(TAG, "conn=%u courier packet from non-link sender; ignoring", evt->conn_handle);
+        return;
+    }
+    size_t idx = session - s_sessions;
+    if (idx >= NOISE_MAX_SESSIONS || !s_identities[idx].valid || !s_identities[idx].verified) {
+        ESP_LOGW(TAG, "conn=%u courier deposit without verified identity", evt->conn_handle);
+        return;
+    }
+    bitchat_packet_t pkt;
+    event_to_packet(evt, BITCHAT_MSG_COURIER_ENVELOPE, &pkt);
+    if (!noise_verify_packet_signature(&pkt, s_identities[idx].sign_key)) {
+        ESP_LOGW(TAG, "conn=%u courier deposit signature invalid", evt->conn_handle);
+        return;
+    }
+    bitle_courier_accept(evt->conn_handle, evt->peer_id, true,
+                         evt->payload, evt->payload_len, bitchat_time_now_ms());
+}
+
+static void process_sync_event(const noise_event_t *evt)
+{
+    bitchat_packet_t pkt;
+    event_to_packet(evt, BITCHAT_MSG_REQUEST_SYNC, &pkt);
+    bitle_sync_handle_request(evt->conn_handle, &pkt);
 }
 
 static void process_subscribed_event(const noise_event_t *evt)
@@ -1609,6 +1719,72 @@ esp_err_t noise_send_raw(uint16_t conn_handle, bitchat_message_type_t type, cons
     return encode_and_send(conn_handle, type, recipient, payload, payload_len, false);
 }
 
+esp_err_t noise_send_packet(uint16_t conn_handle, bitchat_message_type_t type, const uint8_t recipient[8], const uint8_t *payload, size_t payload_len, uint8_t ttl, bool sign)
+{
+    bitchat_packet_t packet;
+    memset(&packet, 0, sizeof(packet));
+    packet.version = 1;
+    packet.type = type;
+    packet.ttl = ttl;
+    packet.timestamp_ms = bitchat_time_now_ms();
+    if (!packet.timestamp_ms) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    memcpy(packet.sender_id, s_peer_id, sizeof(packet.sender_id));
+    if (recipient) {
+        memcpy(packet.recipient_id, recipient, sizeof(packet.recipient_id));
+        packet.has_recipient = true;
+    }
+    packet.payload = (uint8_t *)payload;
+    packet.payload_len = payload_len;
+    if (sign && !sign_packet(&packet)) {
+        return ESP_FAIL;
+    }
+    uint8_t buffer[BITCHAT_BLE_MAX_PACKET_SIZE];
+    size_t encoded_len = sizeof(buffer);
+    if (!bitchat_packet_encode(&packet, buffer, &encoded_len, sizeof(buffer))) {
+        return ESP_FAIL;
+    }
+    return bitchat_ble_send(conn_handle, buffer, encoded_len);
+}
+
+bool noise_get_peer_identity(uint16_t conn_handle, uint8_t noise_key[32], uint8_t sign_key[32], bool *verified)
+{
+    noise_session_t *session = find_session(conn_handle);
+    if (!session) {
+        return false;
+    }
+    size_t idx = session - s_sessions;
+    if (idx >= NOISE_MAX_SESSIONS || !s_identities[idx].valid) {
+        return false;
+    }
+    if (noise_key) {
+        memcpy(noise_key, s_identities[idx].noise_key, 32);
+    }
+    if (sign_key) {
+        memcpy(sign_key, s_identities[idx].sign_key, 32);
+    }
+    if (verified) {
+        *verified = s_identities[idx].verified;
+    }
+    return true;
+}
+
+bool noise_verify_packet_signature(const bitchat_packet_t *packet, const uint8_t sign_key[32])
+{
+    if (!packet || !packet->has_signature) {
+        return false;
+    }
+    uint8_t canonical[BITCHAT_BLE_MAX_PACKET_SIZE];
+    size_t canonical_len = 0;
+    if (!build_canonical_packet(packet, canonical, &canonical_len, sizeof(canonical))) {
+        return false;
+    }
+    return ed25519_sign_open(canonical, canonical_len,
+                             (unsigned char *)sign_key,
+                             (unsigned char *)packet->signature) == 0;
+}
+
 void noise_poll(void)
 {
     /* Session maintenance runs on the worker task's receive timeout; nothing
@@ -1675,6 +1851,11 @@ static void poll_session_maintenance(void)
             if (time_ok && send_announce(session)) {
                 session->last_announce_ms = uptime;
             }
+        }
+        /* Pull the mesh history a passing phone carries (dead-drop refill);
+         * the module rate-limits to one request per peer per minute. */
+        if (session->identity_sent && session->direct_peer) {
+            bitle_sync_tick(session->conn_handle, session->peer_id, uptime);
         }
     }
 }

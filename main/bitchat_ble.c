@@ -20,6 +20,7 @@
 
 #include "bitchat_time.h"
 #include "bitle_ota.h"
+#include "bitle_sync.h"
 #include "noise_handshake.h"
 #include "packet_codec.h"
 
@@ -312,9 +313,15 @@ static void dispatch_packet(uint16_t conn_handle, const bitchat_packet_t *packet
              is_broadcast_recipient(packet) ? "bcast" : (is_local_recipient(packet) ? "us" : "other"),
              packet->is_compressed ? " (compressed)" : "");
 
-    /* Every packet a phone sends carries its wall clock in the header; use
-     * them all so a solo iPhone's first transmission of any type syncs us. */
-    bitchat_time_consider_peer(packet->timestamp_ms);
+    /* Harvest wall time only from directly-connected peers (packets still at
+     * their origin TTL). Announces flow through the authoritative path (which
+     * knows the sender's infra/authority status); other direct packet types
+     * feed only the tentative path, which bootstraps a fresh clock but never
+     * makes a large post-sync correction — so a hostile relayed or replayed
+     * timestamp cannot move an established clock. */
+    if (packet->ttl == BITLE_ORIGIN_TTL && packet->type != BITCHAT_MSG_ANNOUNCE) {
+        bitchat_time_consider_peer(packet->timestamp_ms);
+    }
 
     if (packet->is_compressed) {
         /* No zlib inflate on this target; the relay path still forwards the
@@ -350,10 +357,15 @@ static void dispatch_packet(uint16_t conn_handle, const bitchat_packet_t *packet
     case BITLE_MSG_OTA_STATUS:
         bitle_ota_handle_packet(conn_handle, packet);
         break;
-    case BITCHAT_MSG_LEAVE:
+    case BITCHAT_MSG_COURIER_ENVELOPE:
+        if (is_local_recipient(packet)) {
+            noise_handle_courier(conn_handle, packet);
+        }
+        break;
     case BITCHAT_MSG_REQUEST_SYNC:
-        /* Nothing to do locally; requestSync is link-local. These were
-         * VERSION_HELLO/ACK in the old protocol and must never be answered. */
+        noise_handle_request_sync(conn_handle, packet);
+        break;
+    case BITCHAT_MSG_LEAVE:
         break;
     default:
         ESP_LOGD(TAG, "Ignoring packet type 0x%02X locally", packet->type);
@@ -448,6 +460,11 @@ static bool handle_inbound(uint16_t conn_handle, uint8_t *buffer, uint16_t len)
         return false;
     }
     dispatch_packet(conn_handle, &packet);
+    /* Dead-drop: keep recent signed public packets so passing phones can
+     * sync from us later (the module filters types and enforces budgets). */
+    if (!packet.is_compressed) {
+        bitle_sync_ingest(&packet, buffer, len);
+    }
     relay_packet(conn_handle, buffer, len, &packet);
     bitchat_packet_free(&packet);
     return true;

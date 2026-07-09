@@ -5,6 +5,9 @@ idf_component_register(SRCS
     "packet_codec.c"
     "nickname_manager.c"
     "bitle_ota.c"
+    "bitle_store.c"
+    "bitle_courier.c"
+    "bitle_sync.c"
 INCLUDE_DIRS "."
 REQUIRES bt nvs_flash noise_ref mbedtls bitchat_utils app_update esp_partition
     )

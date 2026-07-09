@@ -26,6 +26,16 @@ static bool s_time_valid;
 static bool s_peer_synced;
 static uint32_t s_sync_generation;
 static uint64_t s_last_persist_uptime_ms;
+/* Anti-ratchet anchor: the wall clock and the monotonic time at the last
+ * confident sync. A legitimate peer's clock advances at real (monotonic)
+ * rate, so an accepted forward time must never exceed anchor_wall + elapsed
+ * monotonic + skew. This caps forward drift to real-time speed and defeats
+ * the "+skew per packet" walk-forward attack. Guarded by s_time_lock. */
+static uint64_t s_anchor_wall_ms;
+static uint64_t s_anchor_mono_ms;
+/* True once our clock traces to a phone (a non-infra peer), directly or via
+ * an authoritative Bitle. Governs whether we accept large corrections. */
+static bool s_time_authoritative;
 
 static uint64_t monotonic_ms(void)
 {
@@ -43,7 +53,10 @@ static void persist_wall_estimate(uint64_t wall_ms)
     nvs_set_u64(handle, BITCHAT_TIME_KEY, wall_ms);
     nvs_commit(handle);
     nvs_close(handle);
-    s_last_persist_uptime_ms = monotonic_ms();
+    uint64_t mono = monotonic_ms();
+    taskENTER_CRITICAL(&s_time_lock);
+    s_last_persist_uptime_ms = mono; /* 64-bit: guard against torn access */
+    taskEXIT_CRITICAL(&s_time_lock);
 }
 
 static uint64_t load_epoch_base(void)
@@ -143,49 +156,138 @@ void bitchat_time_consider_peer(uint64_t peer_timestamp_ms)
         return;
     }
 
-    uint64_t now_monotonic = monotonic_ms();
-    uint64_t current_epoch = bitchat_time_now_ms();
     const uint64_t skew_ms = MAX_CLOCK_SKEW_SECONDS * 1000ULL;
-    const uint64_t big_correction_ms = 60000ULL;
 
-    if (peer_timestamp_ms > current_epoch) {
-        /* Track peer clocks forward with no threshold: our clock is always
-         * at least the newest timestamp heard, so replies to a message can
-         * never be stamped earlier than the message itself. Only large
-         * corrections are worth an NVS write and a re-announce. */
-        uint64_t delta = peer_timestamp_ms - current_epoch;
-        taskENTER_CRITICAL(&s_time_lock);
+    /* Do the whole read-modify-write under one lock with a single monotonic
+     * snapshot so a concurrent call cannot double-acquire or interleave a
+     * stale base. NVS/logging happen after the lock is released, driven by
+     * the captured decision. */
+    bool acquired = false;   /* first-ever sync this boot */
+    bool ignored = false;
+    uint64_t ignored_delta = 0;
+
+    taskENTER_CRITICAL(&s_time_lock);
+    uint64_t now_monotonic = monotonic_ms();
+    if (!s_peer_synced) {
+        /* Initial acquisition: with no reference of our own we must trust the
+         * first peer we hear (in first contact, the operator's own phone).
+         * Accept it and anchor; the anchor bounds all later movement. */
         s_epoch_base_ms = peer_timestamp_ms - now_monotonic;
         s_time_valid = true;
-        taskEXIT_CRITICAL(&s_time_lock);
-        if (delta > big_correction_ms || !s_peer_synced) {
-            s_peer_synced = true;
-            s_sync_generation++;
-            persist_wall_estimate(peer_timestamp_ms);
-            ESP_LOGI(TAG, "Epoch base adjusted forward by %llu ms to %llu",
-                     (unsigned long long)delta, (unsigned long long)peer_timestamp_ms);
-        }
-        return;
-    }
-
-    /* Peer timestamp is not ahead of us. Before the first sync this can mean
-     * our build/NVS seed runs fast, so correct backward once; afterwards a
-     * lower timestamp is just an older (possibly relayed) packet. */
-    uint64_t behind = current_epoch - peer_timestamp_ms;
-    if (!s_peer_synced) {
-        if (behind > skew_ms) {
-            taskENTER_CRITICAL(&s_time_lock);
-            s_epoch_base_ms = peer_timestamp_ms - now_monotonic;
-            s_time_valid = true;
-            taskEXIT_CRITICAL(&s_time_lock);
-            ESP_LOGI(TAG, "Epoch base adjusted backward to %llu", (unsigned long long)peer_timestamp_ms);
-            persist_wall_estimate(peer_timestamp_ms);
-        } else {
-            ESP_LOGI(TAG, "Epoch confirmed by peer at %llu", (unsigned long long)current_epoch);
-            persist_wall_estimate(current_epoch);
-        }
         s_peer_synced = true;
         s_sync_generation++;
+        s_anchor_wall_ms = peer_timestamp_ms;
+        s_anchor_mono_ms = now_monotonic;
+        acquired = true;
+    } else {
+        uint64_t current_epoch = s_epoch_base_ms + now_monotonic;
+        uint64_t delta = peer_timestamp_ms > current_epoch
+                             ? peer_timestamp_ms - current_epoch
+                             : current_epoch - peer_timestamp_ms;
+        /* Reject anything outside the skew window of our established clock:
+         * blocks the single-packet far-future poison. */
+        if (delta > skew_ms) {
+            ignored = true;
+            ignored_delta = delta;
+        } else if (peer_timestamp_ms > current_epoch) {
+            /* Ahead and in-window: forward-track for reply ordering, but cap
+             * against the anchor so the clock cannot be ratcheted faster than
+             * real time by a stream of just-in-window packets. */
+            uint64_t projected_cap = s_anchor_wall_ms +
+                                     (now_monotonic - s_anchor_mono_ms) + skew_ms;
+            if (peer_timestamp_ms <= projected_cap) {
+                s_epoch_base_ms = peer_timestamp_ms - now_monotonic;
+            } else {
+                ignored = true;
+                ignored_delta = peer_timestamp_ms - projected_cap;
+            }
+        }
+    }
+    taskEXIT_CRITICAL(&s_time_lock);
+
+    if (acquired) {
+        persist_wall_estimate(peer_timestamp_ms);
+        ESP_LOGI(TAG, "Initial clock acquired from peer: %llu", (unsigned long long)peer_timestamp_ms);
+    } else if (ignored) {
+        ESP_LOGW(TAG, "Ignoring out-of-window peer time (delta %llus)",
+                 (unsigned long long)(ignored_delta / 1000ULL));
+    }
+}
+
+bool bitchat_time_is_authoritative(void)
+{
+    return s_time_authoritative;
+}
+
+void bitchat_time_consider_peer_announce(uint64_t peer_timestamp_ms,
+                                         bool peer_is_infra, bool peer_is_authoritative)
+{
+    if (peer_timestamp_ms == 0 ||
+        (peer_timestamp_ms / 1000ULL) < MIN_VALID_EPOCH_SECONDS) {
+        return;
+    }
+    const uint64_t skew_ms = MAX_CLOCK_SKEW_SECONDS * 1000ULL;
+    const bool source_is_phone = !peer_is_infra;
+    const bool source_authoritative = source_is_phone || peer_is_authoritative;
+
+    bool changed = false;   /* clock (re)acquired -> persist + re-announce */
+    bool upgraded = false;  /* only the authority flag flipped */
+    uint64_t new_wall = 0;
+
+    taskENTER_CRITICAL(&s_time_lock);
+    uint64_t now_monotonic = monotonic_ms();
+    if (!s_peer_synced) {
+        s_epoch_base_ms = peer_timestamp_ms - now_monotonic;
+        s_time_valid = true;
+        s_peer_synced = true;
+        s_sync_generation++;
+        s_anchor_wall_ms = peer_timestamp_ms;
+        s_anchor_mono_ms = now_monotonic;
+        s_time_authoritative = source_authoritative;
+        changed = true;
+        new_wall = peer_timestamp_ms;
+    } else {
+        uint64_t current_epoch = s_epoch_base_ms + now_monotonic;
+        uint64_t delta = peer_timestamp_ms > current_epoch
+                             ? peer_timestamp_ms - current_epoch
+                             : current_epoch - peer_timestamp_ms;
+        /* A phone always corrects us; an authoritative Bitle corrects us only
+         * while we are not yet authoritative (propagation, not poisoning). */
+        bool allow_large = source_is_phone || (peer_is_authoritative && !s_time_authoritative);
+        if (delta <= skew_ms) {
+            if (peer_timestamp_ms > current_epoch) {
+                uint64_t cap = s_anchor_wall_ms +
+                               (now_monotonic - s_anchor_mono_ms) + skew_ms;
+                if (peer_timestamp_ms <= cap) {
+                    s_epoch_base_ms = peer_timestamp_ms - now_monotonic;
+                }
+            }
+            if (source_authoritative && !s_time_authoritative) {
+                s_time_authoritative = true;
+                s_sync_generation++; /* re-announce carrying the authority flag */
+                upgraded = true;
+            }
+        } else if (allow_large) {
+            s_epoch_base_ms = peer_timestamp_ms - now_monotonic;
+            s_anchor_wall_ms = peer_timestamp_ms;
+            s_anchor_mono_ms = now_monotonic;
+            s_sync_generation++;
+            if (source_authoritative) {
+                s_time_authoritative = true;
+            }
+            changed = true;
+            new_wall = peer_timestamp_ms;
+        }
+        /* else: non-authoritative and out of window -> ignore (anti-poison) */
+    }
+    taskEXIT_CRITICAL(&s_time_lock);
+
+    if (changed) {
+        persist_wall_estimate(new_wall);
+        ESP_LOGI(TAG, "Clock corrected by %s peer to %llu",
+                 source_is_phone ? "phone" : "authoritative", (unsigned long long)new_wall);
+    } else if (upgraded) {
+        ESP_LOGI(TAG, "Clock now authoritative (phone-traced)");
     }
 }
 
@@ -194,13 +296,16 @@ void bitchat_time_set_from_wall(uint64_t unix_ms)
     if (unix_ms == 0 || unix_ms / 1000ULL < MIN_VALID_EPOCH_SECONDS) {
         return;
     }
-    uint64_t now_monotonic = monotonic_ms();
     taskENTER_CRITICAL(&s_time_lock);
+    uint64_t now_monotonic = monotonic_ms();
     s_epoch_base_ms = unix_ms - now_monotonic;
     s_time_valid = true;
-    taskEXIT_CRITICAL(&s_time_lock);
     s_peer_synced = true;
     s_sync_generation++;
+    s_anchor_wall_ms = unix_ms;      /* trusted source re-anchors the clock */
+    s_anchor_mono_ms = now_monotonic;
+    s_time_authoritative = true;
+    taskEXIT_CRITICAL(&s_time_lock);
     persist_wall_estimate(unix_ms);
     ESP_LOGI(TAG, "Epoch base forced to %llu", (unsigned long long)(unix_ms - now_monotonic));
 }
@@ -208,7 +313,10 @@ void bitchat_time_set_from_wall(uint64_t unix_ms)
 void bitchat_time_poll(void)
 {
     uint64_t uptime = monotonic_ms();
-    if (uptime - s_last_persist_uptime_ms < PERSIST_INTERVAL_MS) {
+    taskENTER_CRITICAL(&s_time_lock);
+    uint64_t last = s_last_persist_uptime_ms;
+    taskEXIT_CRITICAL(&s_time_lock);
+    if (uptime - last < PERSIST_INTERVAL_MS) {
         return;
     }
     uint64_t now = bitchat_time_now_ms();

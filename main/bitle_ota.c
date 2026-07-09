@@ -483,7 +483,12 @@ esp_err_t bitle_ota_init(void)
         size_t len = sizeof(raw);
         if (nvs_get_blob(handle, OTA_MANIFEST_KEY, raw, &len) == ESP_OK && len == sizeof(raw)) {
             ota_manifest_t manifest;
-            if (parse_manifest(raw, len, &manifest) && manifest.version == BITLE_FW_VERSION) {
+            /* Hash-check against the running image too: a wire reflash can
+             * leave a stale same-version manifest behind, and serving
+             * chunks that do not match the manifest would only waste every
+             * receiver's transfer. */
+            if (parse_manifest(raw, len, &manifest) && manifest.version == BITLE_FW_VERSION &&
+                hash_matches_running_image(&manifest)) {
                 s_serve_manifest = manifest;
                 s_can_serve = true;
                 ESP_LOGI(TAG, "Serving firmware v%lu (%lu bytes)",

@@ -101,6 +101,7 @@ bool bitchat_packet_decode(const uint8_t *data, size_t len, bitchat_packet_t *ou
     /* zlib-compressed payload (flag 0x04): we cannot inflate it locally, but
      * the header and raw bytes stay usable for time sync and relaying. */
     out_packet->is_compressed = (flags & 0x04) != 0;
+    out_packet->is_rsr = (flags & 0x10) != 0;
 
     if (flags & 0x01) {
         out_packet->has_recipient = true;
@@ -189,6 +190,9 @@ bool bitchat_packet_encode(const bitchat_packet_t *packet, uint8_t *out_buf, siz
     if (packet->has_signature) {
         flags |= 0x02;
     }
+    if (packet->is_rsr) {
+        flags |= 0x10;
+    }
     out_buf[offset++] = flags;
 
     out_buf[offset++] = (packet->payload_len >> 8) & 0xFF;
@@ -223,6 +227,7 @@ bool bitchat_packet_encode_canonical(const bitchat_packet_t *packet, uint8_t *ou
 {
     bitchat_packet_t canonical = *packet;
     canonical.ttl = 0;
+    canonical.is_rsr = false;
     canonical.has_signature = false;
     memset(canonical.signature, 0, sizeof(canonical.signature));
     size_t len = max_len;

@@ -10,7 +10,21 @@ extern "C" {
 
 esp_err_t bitchat_time_init(void);
 uint64_t bitchat_time_now_ms(void);
+/* Tentative time source (any direct packet): bootstraps the clock before the
+ * first sync and applies small forward nudges after, but never makes a large
+ * post-sync correction (anti-poisoning). */
 void bitchat_time_consider_peer(uint64_t peer_timestamp_ms);
+/* Authoritative time source (a verified direct announce). Phones carry no
+ * 0xB1 flag (peer_is_infra=false) and are the time authority: they may
+ * correct even a wrong, already-synced clock. Another Bitle (infra) may only
+ * make a large correction when it is itself phone-authoritative and we are
+ * not — this propagates real time hop-by-hop without letting clock-less
+ * nodes poison each other. */
+void bitchat_time_consider_peer_announce(uint64_t peer_timestamp_ms,
+                                         bool peer_is_infra, bool peer_is_authoritative);
+/* True when our clock traces (directly or hop-by-hop) to a phone this boot.
+ * Advertised in the 0xB1 announce flag so peers can propagate it. */
+bool bitchat_time_is_authoritative(void);
 void bitchat_time_set_from_wall(uint64_t unix_ms);
 bool bitchat_time_is_valid(void);
 /* True once the clock has been synced or confirmed by a peer this boot. */
