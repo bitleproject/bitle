@@ -26,6 +26,12 @@ typedef enum {
      * the pre-consolidation protocol and must never be answered as such. */
     BITCHAT_MSG_FRAGMENT = 0x20,
     BITCHAT_MSG_REQUEST_SYNC = 0x21,
+    /* Bitle-private OTA types, outside the upstream range. Phones ignore
+     * them locally but relay them, so updates can cross phone bridges. */
+    BITLE_MSG_OTA_MANIFEST = 0xA0,
+    BITLE_MSG_OTA_REQ = 0xA1,
+    BITLE_MSG_OTA_CHUNK = 0xA2,
+    BITLE_MSG_OTA_STATUS = 0xA3,
 } bitchat_message_type_t;
 
 typedef enum {
@@ -73,6 +79,9 @@ const uint8_t *noise_get_static_public_key(void);
 void noise_begin_handshake(uint16_t conn_handle, const uint8_t peer_id[8], const char *nickname);
 bool noise_can_begin_handshake(uint16_t conn_handle);
 bool noise_send_encrypted(uint16_t conn_handle, bitchat_noise_payload_type_t payload_type, const uint8_t *payload, size_t payload_len);
+/* Sends an unsigned, unencrypted packet of the given type (used for the
+ * Bitle OTA types; image integrity comes from the signed manifest). */
+esp_err_t noise_send_raw(uint16_t conn_handle, bitchat_message_type_t type, const uint8_t recipient[8], const uint8_t *payload, size_t payload_len);
 void noise_poll(void);
 esp_err_t bitchat_noise_init(void);
 

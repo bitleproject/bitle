@@ -1,0 +1,9 @@
+# Bitle OTA partition layout (2 MB flash).
+# nvs and phy_init keep the stock offsets so identity keys, nickname and
+# clock state survive the migration from the single-factory layout.
+# Name,    Type, SubType, Offset,   Size
+nvs,       data, nvs,     0x9000,   0x6000
+phy_init,  data, phy,     0xf000,   0x1000
+otadata,   data, ota,     0x10000,  0x2000
+ota_0,     app,  ota_0,   0x20000,  0xF0000
+ota_1,     app,  ota_1,   0x110000, 0xF0000

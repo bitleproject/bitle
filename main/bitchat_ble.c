@@ -19,6 +19,7 @@
 #include "services/gatt/ble_svc_gatt.h"
 
 #include "bitchat_time.h"
+#include "bitle_ota.h"
 #include "noise_handshake.h"
 #include "packet_codec.h"
 
@@ -254,6 +255,12 @@ static void dispatch_packet(uint16_t conn_handle, const bitchat_packet_t *packet
         break;
     case BITCHAT_MSG_FRAGMENT:
         handle_fragment(conn_handle, packet);
+        break;
+    case BITLE_MSG_OTA_MANIFEST:
+    case BITLE_MSG_OTA_REQ:
+    case BITLE_MSG_OTA_CHUNK:
+    case BITLE_MSG_OTA_STATUS:
+        bitle_ota_handle_packet(conn_handle, packet);
         break;
     case BITCHAT_MSG_LEAVE:
     case BITCHAT_MSG_REQUEST_SYNC:

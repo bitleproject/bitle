@@ -16,6 +16,7 @@
 
 #include "bitchat_ble.h"
 #include "bitchat_time.h"
+#include "bitle_ota.h"
 #include "nickname_manager.h"
 #include "packet_codec.h"
 
@@ -87,6 +88,7 @@ typedef struct {
     bool valid;
     bool verified;              /* Ed25519 packet signature checked out */
     uint64_t timestamp_ms;
+    uint32_t fw_version;        /* Bitle TLV 0xB0; 0 for phones/older nodes */
     uint8_t nickname_len;
     char nickname[sizeof(s_nickname)];
     uint8_t peer_id[8];
@@ -627,6 +629,16 @@ static bool build_announce_payload(uint8_t *buffer, size_t buffer_len, size_t *o
     memcpy(buffer + offset, s_ed25519_public, sizeof(s_ed25519_public));
     offset += sizeof(s_ed25519_public);
 
+    /* Bitle-private firmware version TLV; unknown TLVs are skipped by the
+     * phones' tolerant decoders, and other Bitle nodes use it to decide
+     * whether to offer an OTA image. */
+    buffer[offset++] = 0xB0;
+    buffer[offset++] = 4;
+    buffer[offset++] = (BITLE_FW_VERSION >> 24) & 0xFF;
+    buffer[offset++] = (BITLE_FW_VERSION >> 16) & 0xFF;
+    buffer[offset++] = (BITLE_FW_VERSION >> 8) & 0xFF;
+    buffer[offset++] = BITLE_FW_VERSION & 0xFF;
+
     *out_len = offset;
     return true;
 }
@@ -925,6 +937,12 @@ static bool parse_announce_tlv(const uint8_t *payload, size_t len, noise_identit
             }
             memcpy(record->sign_key, value, tlv_len);
             have_sign = true;
+            break;
+        case 0xB0:
+            if (tlv_len == 4) {
+                record->fw_version = ((uint32_t)value[0] << 24) | ((uint32_t)value[1] << 16) |
+                                     ((uint32_t)value[2] << 8) | value[3];
+            }
             break;
         default:
             break;
@@ -1366,6 +1384,12 @@ static void process_announce_event(const noise_event_t *evt)
              * leave it unverified rather than breaking interop. */
             ESP_LOGW(TAG, "conn=%u ANNOUNCE signature did not verify", conn_handle);
         }
+        if (sig_ok) {
+            /* End-to-end proof the radio + crypto of this image works;
+             * lets a freshly OTA'd image cancel its rollback window. */
+            bitle_ota_mark_healthy();
+            bitle_ota_peer_version_seen(conn_handle, evt->peer_id, ident.fw_version);
+        }
         if (is_direct) {
             noise_session_t *session = alloc_session(conn_handle);
             if (session) {
@@ -1555,6 +1579,11 @@ bool noise_send_encrypted(uint16_t conn_handle, bitchat_noise_payload_type_t pay
 bool noise_post_handshake_event(noise_evt_type_t type, uint16_t conn_handle, const uint8_t peer_id[8], bool initiator, const uint8_t *payload, uint16_t payload_len)
 {
     return enqueue_event(type, conn_handle, peer_id, initiator, payload, payload_len);
+}
+
+esp_err_t noise_send_raw(uint16_t conn_handle, bitchat_message_type_t type, const uint8_t recipient[8], const uint8_t *payload, size_t payload_len)
+{
+    return encode_and_send(conn_handle, type, recipient, payload, payload_len, false);
 }
 
 void noise_poll(void)

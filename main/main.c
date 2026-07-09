@@ -6,6 +6,7 @@
 
 #include "bitchat_ble.h"
 #include "bitchat_time.h"
+#include "bitle_ota.h"
 #include "noise_handshake.h"
 #include "packet_codec.h"
 
@@ -38,6 +39,7 @@ void app_main(void)
 
     ESP_ERROR_CHECK(bitchat_time_init());
     ESP_ERROR_CHECK(bitchat_noise_init());
+    ESP_ERROR_CHECK(bitle_ota_init());
     packet_codec_init();
     if (!packet_codec_self_test()) {
         ESP_LOGE(TAG, "Packet codec self-test failed");

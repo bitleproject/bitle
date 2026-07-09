@@ -4,8 +4,9 @@ idf_component_register(SRCS
     "noise_handshake.c"
     "packet_codec.c"
     "nickname_manager.c"
+    "bitle_ota.c"
 INCLUDE_DIRS "."
-REQUIRES bt nvs_flash noise_ref mbedtls bitchat_utils
+REQUIRES bt nvs_flash noise_ref mbedtls bitchat_utils app_update esp_partition
     )
 
 target_include_directories(${COMPONENT_LIB} PRIVATE
