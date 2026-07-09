@@ -40,12 +40,17 @@
 #define NOISE_PROLOGUE            ""
 
 #define NOISE_MAX_SESSIONS        CONFIG_BT_NIMBLE_MAX_CONNECTIONS
-#define NOISE_QUEUE_DEPTH         8
+#define NOISE_QUEUE_DEPTH         12
 #define NOISE_MESSAGE_MAX         256
+#define NOISE_EVENT_PAYLOAD_MAX   320
 #define NOISE_PACKET_TTL          7
-#define NOISE_MAX_ENCRYPTED_PAYLOAD 240
+#define NOISE_MAX_ENCRYPTED_PAYLOAD 320
 #define ANNOUNCE_INTERVAL_MS      (10 * 1000ULL)
-#define FALLBACK_IDENTITY_TIMEOUT_MS (5 * 1000ULL)
+
+#define BITLE_AUTO_REPLY_TEXT \
+    "This is an automated response: Bitle is a relay node designed to " \
+    "expand the reach of bluetooth mesh networks. It relays encrypted " \
+    "packets while maintaining e2e encryption. bitle.org."
 
 static const char *TAG = "noise";
 static const char IDENTITY_BINDING_PREFIX[] = "bitchat-announce-v1";
@@ -69,25 +74,38 @@ typedef struct {
     uint8_t handshake_hash[64];
     size_t handshake_hash_len;
     uint64_t last_announce_ms;
-    bool peer_identity_seen;
     bool identity_sent;
-    uint64_t fallback_deadline_ms;
+    uint32_t sent_sync_gen;
+    uint32_t tx_nonce;
+    bool auto_replied;
+    bool direct_peer;
+    uint8_t hs_attempts;
+    uint64_t next_hs_ms;
 } noise_session_t;
 
 typedef struct {
     bool valid;
+    bool verified;              /* Ed25519 packet signature checked out */
     uint64_t timestamp_ms;
     uint8_t nickname_len;
     char nickname[sizeof(s_nickname)];
     uint8_t peer_id[8];
+    uint8_t noise_key[32];
+    uint8_t sign_key[32];
 } noise_identity_t;
 
 typedef struct {
     noise_evt_type_t type;
     uint16_t conn_handle;
     bool initiator;
+    /* Header fields needed to rebuild the canonical bytes for signature
+     * verification on the worker task. */
+    uint64_t timestamp_ms;
+    uint8_t ttl;
+    bool has_signature;
+    uint8_t signature[64];
     uint8_t peer_id[8];
-    uint8_t payload[NOISE_MESSAGE_MAX];
+    uint8_t payload[NOISE_EVENT_PAYLOAD_MAX];
     uint16_t payload_len;
 } noise_event_t;
 
@@ -121,24 +139,25 @@ static size_t apply_pkcs7_padding(uint8_t *buffer, size_t buffer_len, size_t cur
 static bool build_canonical_packet(const bitchat_packet_t *packet, uint8_t *out_buf, size_t *out_len, size_t max_len);
 static bool build_identity_payload(uint8_t *buffer, size_t buffer_len, size_t *out_len);
 static bool sign_packet(bitchat_packet_t *packet);
-static bool parse_identity(const bitchat_packet_t *packet, noise_identity_t *record);
+static bool parse_identity_payload(const uint8_t *p, size_t len, noise_identity_t *record);
+static bool parse_announce_tlv(const uint8_t *payload, size_t len, noise_identity_t *record);
 static bool encrypt_payload(noise_session_t *session, const uint8_t *input, size_t input_len, uint8_t *output, size_t *output_len);
 static bool decrypt_payload(noise_session_t *session, const uint8_t *input, size_t input_len, uint8_t *output, size_t *output_len);
-static void handle_noise_payload(uint16_t conn_handle, const bitchat_packet_t *packet, noise_session_t *session, const uint8_t *decrypted, size_t decrypted_len);
-static void handle_version(uint16_t conn_handle, const bitchat_packet_t *packet);
+static void handle_noise_payload(uint16_t conn_handle, const noise_event_t *evt, noise_session_t *session, const uint8_t *decrypted, size_t decrypted_len);
 static void format_hex(const uint8_t *data, size_t len, char *out, size_t out_len);
-static bool send_version_message(noise_session_t *session, uint8_t type, uint8_t flags, uint8_t version);
 static bool send_identity_announce(noise_session_t *session);
+static void process_announce_event(const noise_event_t *evt);
+static void process_identity_event(const noise_event_t *evt);
+static void process_encrypted_event(const noise_event_t *evt);
+static void process_subscribed_event(const noise_event_t *evt);
 static bool send_announce(noise_session_t *session);
 static esp_err_t encode_and_send(uint16_t conn_handle, bitchat_message_type_t type, const uint8_t *recipient_id, const uint8_t *payload, size_t payload_len, bool sign);
-static esp_err_t queue_event(const noise_event_t *evt);
+static esp_err_t queue_event(const noise_event_t *evt, TickType_t wait_ticks);
 static bool enqueue_event(noise_evt_type_t type, uint16_t conn_handle, const uint8_t peer_id[8], bool initiator, const uint8_t *payload, uint16_t payload_len);
 static void handshake_task(void *arg);
 static bool init_worker(void);
 static void poll_session_maintenance(void);
 static bool try_send_identity(noise_session_t *session);
-static noise_session_t *find_session_by_conn(uint16_t conn_handle);
-static void consider_packet_timestamp(const bitchat_packet_t *packet);
 
 static void load_identity(void)
 {
@@ -252,9 +271,8 @@ static void free_session(noise_session_t *session)
     memset(session->peer_id, 0, sizeof(session->peer_id));
     session->initiator = false;
     session->established = false;
-    session->peer_identity_seen = false;
     session->identity_sent = false;
-    session->fallback_deadline_ms = 0;
+    session->sent_sync_gen = 0;
     session->in_use = false;
     if (idx < NOISE_MAX_SESSIONS) {
         memset(&s_identities[idx], 0, sizeof(s_identities[idx]));
@@ -313,9 +331,7 @@ static bool start_handshake(noise_session_t *session, const noise_event_t *evt)
         return false;
     }
     memcpy(session->peer_id, evt->peer_id, sizeof(session->peer_id));
-    session->peer_identity_seen = false;
     session->identity_sent = false;
-    session->fallback_deadline_ms = 0;
     session->established = false;
     ESP_LOGI(TAG, "conn=%u handshake started, action=%d initiator=%d", session->conn_handle,
              noise_handshakestate_get_action(session->handshake), session->initiator);
@@ -324,6 +340,14 @@ static bool start_handshake(noise_session_t *session, const noise_event_t *evt)
 
 static bool process_handshake(noise_session_t *session, const noise_event_t *evt)
 {
+    if (session->handshake && session->initiator && evt->payload_len == 32) {
+        /* Simultaneous handshakes: a 32-byte message is a fresh initiation.
+         * Mirror upstream and yield — drop our initiator state and respond
+         * to the peer's initiation instead. */
+        ESP_LOGI(TAG, "conn=%u handshake collision; yielding to peer initiation", session->conn_handle);
+        clear_crypto(session);
+        session->established = false;
+    }
     if (!session->handshake) {
         if (!start_handshake(session, evt)) {
             ESP_LOGW(TAG, "conn=%u failed to start handshake", session->conn_handle);
@@ -349,15 +373,10 @@ static bool process_handshake(noise_session_t *session, const noise_event_t *evt
 
     int err = noise_handshakestate_read_message(session->handshake, &message, &response_buf);
     if (err != NOISE_ERROR_NONE) {
+        /* The handshake state is not re-entrant after a failed read; the
+         * session must be torn down and restarted. */
         ESP_LOGW(TAG, "noise_handshakestate_read_message(len=%u) failed conn=%u err=%d", (unsigned)evt->payload_len, session->conn_handle, err);
-        ESP_LOG_BUFFER_HEXDUMP(TAG, message.data, message.size, ESP_LOG_WARN);
-        noise_buffer_set_output(response_buf, response, sizeof(response));
-        err = noise_handshakestate_read_message(session->handshake, &message, NULL);
-        if (err != NOISE_ERROR_NONE) {
-            ESP_LOGW(TAG, "retry read without payload buffer failed err=%d", err);
-            return false;
-        }
-        ESP_LOGW(TAG, "retry read without payload buffer succeeded");
+        return false;
     }
 
     if (response_buf.size > 0) {
@@ -425,11 +444,12 @@ static bool send_handshake_message(noise_session_t *session)
         ESP_LOGD(TAG, "conn=%u write_message produced empty buffer", session->conn_handle);
         return true;
     }
-    ESP_LOGI(TAG, "conn=%u noise_handshakestate_write_message size=%u", session->conn_handle, (unsigned)msg.size);
-    ESP_LOG_BUFFER_HEXDUMP(TAG, msg.data, msg.size, ESP_LOG_INFO);
+    ESP_LOGD(TAG, "conn=%u noise_handshakestate_write_message size=%u", session->conn_handle, (unsigned)msg.size);
+    /* Handshake packets are directed whenever the peer is known — both as
+     * initiator and as responder; iOS ignores undirected handshakes. */
     const bool peer_known = (session->peer_id[0] | session->peer_id[1] | session->peer_id[2] | session->peer_id[3] |
                              session->peer_id[4] | session->peer_id[5] | session->peer_id[6] | session->peer_id[7]) != 0;
-    const uint8_t *recipient = ((!session->initiator || !peer_known) ? NULL : session->peer_id);
+    const uint8_t *recipient = peer_known ? session->peer_id : NULL;
 
     return encode_and_send(session->conn_handle, BITCHAT_MSG_NOISE_HANDSHAKE, recipient, msg.data, msg.size, false) == ESP_OK;
 }
@@ -445,6 +465,7 @@ static bool derive_transport_keys(noise_session_t *session)
     }
     session->tx_cipher = tx;
     session->rx_cipher = rx;
+    session->tx_nonce = 0;
     session->handshake_hash_len = noise_handshakestate_get_handshake_hash(session->handshake, session->handshake_hash, sizeof(session->handshake_hash));
     session->established = true;
     ESP_LOGI(TAG, "Handshake split complete conn=%u", session->conn_handle);
@@ -458,39 +479,39 @@ static void mark_established(noise_session_t *session)
     session->handshake = NULL;
     session->established = true;
     session->identity_sent = false;
-    session->fallback_deadline_ms = 0;
     size_t idx = session - s_sessions;
     if (idx < NOISE_MAX_SESSIONS) {
         s_identity_pending[idx] = true;
-        ESP_LOGI(TAG, "Queued identity announce pending VERSION_ACK conn=%u", session->conn_handle);
     }
-    if (bitchat_time_is_valid()) {
-        session->peer_identity_seen = true;
-        if (try_send_identity(session)) {
-            ESP_LOGI(TAG, "conn=%u identity sent immediately after handshake", session->conn_handle);
-        }
+    if (try_send_identity(session)) {
+        ESP_LOGI(TAG, "conn=%u identity sent immediately after handshake", session->conn_handle);
     }
 }
 
+/* Mirrors upstream MessagePadding.optimalBlockSize: smallest standard block
+ * that fits the data plus 16 bytes of assumed overhead; 0 means "no padding"
+ * (upstream leaves oversized packets unpadded). */
 static size_t choose_padding_block(size_t payload_len)
 {
     static const size_t blocks[] = {256, 512, 1024, 2048};
     for (size_t i = 0; i < sizeof(blocks) / sizeof(blocks[0]); ++i) {
-        if (payload_len <= blocks[i]) {
+        if (payload_len + 16 <= blocks[i]) {
             return blocks[i];
         }
     }
-    return blocks[sizeof(blocks) / sizeof(blocks[0]) - 1];
+    return 0;
 }
 
+/* Mirrors upstream MessagePadding.pad: pad to exactly block_size with PKCS#7
+ * bytes; a pad run longer than 255 cannot be encoded, so upstream signs those
+ * packets unpadded and we must do the same. */
 static size_t apply_pkcs7_padding(uint8_t *buffer, size_t buffer_len, size_t current_len, size_t block_size)
 {
-    if (block_size == 0 || block_size > buffer_len) {
+    if (block_size == 0 || current_len >= block_size || block_size > buffer_len) {
         return current_len;
     }
-    size_t remainder = current_len % block_size;
-    size_t pad_len = (remainder == 0) ? block_size : (block_size - remainder);
-    if (current_len + pad_len > buffer_len) {
+    size_t pad_len = block_size - current_len;
+    if (pad_len > 255) {
         return current_len;
     }
     memset(buffer + current_len, (uint8_t)pad_len, pad_len);
@@ -705,51 +726,33 @@ static bool try_send_identity(noise_session_t *session)
     if (!s_identity_pending[idx]) {
         return false;
     }
-    if (!session->established) {
-        ESP_LOGI(TAG, "conn=%u deferring identity; Noise not established", session->conn_handle);
-        return false;
+    if (session->identity_sent) {
+        return true;
     }
-    uint64_t now_ms = bitchat_time_now_ms();
-    if (!now_ms) {
-        now_ms = esp_timer_get_time() / 1000ULL;
+    if (!bitchat_ble_conn_subscribed(session->conn_handle)) {
+        /* Link cannot carry notifications yet; the subscribe event or the
+         * BLE watchdog will get us unstuck — stay quiet until then. */
+        return false;
     }
     if (!bitchat_time_is_valid()) {
         ESP_LOGI(TAG, "conn=%u deferring identity; time not valid", session->conn_handle);
         return false;
     }
-    if (session->identity_sent) {
-        return true;
-    }
-    if (!session->peer_identity_seen) {
-        if (!session->fallback_deadline_ms) {
-            session->fallback_deadline_ms = now_ms + FALLBACK_IDENTITY_TIMEOUT_MS;
-            ESP_LOGI(TAG, "conn=%u waiting for peer identity before announcing", session->conn_handle);
-            return false;
-        }
-        if (now_ms < session->fallback_deadline_ms) {
-            return false;
-        }
-        ESP_LOGW(TAG, "conn=%u fallback identity timeout reached", session->conn_handle);
-        session->peer_identity_seen = true;
-    }
-    if (!send_identity_announce(session)) {
-        ESP_LOGW(TAG, "Failed to send IDENTITY_ANNOUNCE conn=%u; will retry", session->conn_handle);
+    /* The signed ANNOUNCE is what current clients require before they will
+     * talk to us (identity rides in its TLVs), so it gates success; the
+     * legacy 0x13 identity announce is best-effort for older clients. */
+    if (!send_announce(session)) {
+        ESP_LOGW(TAG, "Failed to send ANNOUNCE conn=%u; will retry", session->conn_handle);
         return false;
     }
-    if (!send_announce(session)) {
-        ESP_LOGW(TAG, "Failed to send ANNOUNCE after identity conn=%u", session->conn_handle);
+    if (!send_identity_announce(session)) {
+        ESP_LOGD(TAG, "Legacy identity announce skipped conn=%u", session->conn_handle);
     }
     s_identity_pending[idx] = false;
     session->identity_sent = true;
-    session->fallback_deadline_ms = 0;
-    session->last_announce_ms = now_ms;
+    session->sent_sync_gen = bitchat_time_sync_generation();
     ESP_LOGI(TAG, "conn=%u identity and announce sent", session->conn_handle);
     return true;
-}
-
-static noise_session_t *find_session_by_conn(uint16_t conn_handle)
-{
-    return find_session(conn_handle);
 }
 
 static bool send_announce(noise_session_t *session)
@@ -774,9 +777,6 @@ static bool send_announce(noise_session_t *session)
     packet.type = BITCHAT_MSG_ANNOUNCE;
     packet.ttl = NOISE_PACKET_TTL;
     packet.timestamp_ms = bitchat_time_now_ms();
-    if (!packet.timestamp_ms) {
-        packet.timestamp_ms = (uint64_t)esp_timer_get_time();
-    }
     memcpy(packet.sender_id, s_peer_id, sizeof(packet.sender_id));
     packet.payload = announce_payload;
     packet.payload_len = announce_len;
@@ -797,22 +797,16 @@ static bool send_announce(noise_session_t *session)
         return false;
     }
 
-    uint64_t now = bitchat_time_now_ms();
-    if (!now) {
-        now = esp_timer_get_time() / 1000ULL;
-    }
-    session->last_announce_ms = now;
+    session->last_announce_ms = esp_timer_get_time() / 1000ULL;
     ESP_LOGI(TAG, "conn=%u sent ANNOUNCE (%u bytes)", session->conn_handle, (unsigned)announce_len);
     return true;
 }
 
-static bool parse_identity(const bitchat_packet_t *packet, noise_identity_t *record)
+static bool parse_identity_payload(const uint8_t *p, size_t len, noise_identity_t *record)
 {
-    if (!record || !packet || !packet->payload || packet->payload_len < 1) {
+    if (!record || !p || len < 1) {
         return false;
     }
-    const uint8_t *p = packet->payload;
-    size_t len = packet->payload_len;
     size_t offset = 0;
 
     if (offset + 1 + sizeof(record->peer_id) > len) {
@@ -883,33 +877,141 @@ static bool parse_identity(const bitchat_packet_t *packet, noise_identity_t *rec
     record->timestamp_ms = timestamp;
     record->valid = true;
     bitchat_time_consider_peer(timestamp);
-    bitchat_time_set_from_wall(timestamp);
     return true;
 }
 
-static bool encrypt_payload(noise_session_t *session, const uint8_t *input, size_t input_len, uint8_t *output, size_t *output_len)
+/* Parses the current-protocol ANNOUNCE TLV payload: 0x01 nickname,
+ * 0x02 Noise static key, 0x03 Ed25519 signing key; unknown TLVs are
+ * skipped for forward compatibility (mirrors AnnouncementPacket.decode). */
+static bool parse_announce_tlv(const uint8_t *payload, size_t len, noise_identity_t *record)
 {
-    if (!session || !session->tx_cipher || !output || !output_len || input_len > *output_len) {
+    if (!payload || !record) {
         return false;
     }
-    memcpy(output, input, input_len);
+    bool have_nick = false;
+    bool have_noise = false;
+    bool have_sign = false;
+    size_t offset = 0;
+    while (offset + 2 <= len) {
+        uint8_t tlv_type = payload[offset++];
+        uint8_t tlv_len = payload[offset++];
+        if (offset + tlv_len > len) {
+            return false;
+        }
+        const uint8_t *value = payload + offset;
+        offset += tlv_len;
+        switch (tlv_type) {
+        case 0x01: {
+            if (tlv_len == 0) {
+                return false;
+            }
+            uint8_t copy_len = tlv_len < sizeof(record->nickname) - 1 ? tlv_len : (uint8_t)(sizeof(record->nickname) - 1);
+            memcpy(record->nickname, value, copy_len);
+            record->nickname[copy_len] = '\0';
+            record->nickname_len = copy_len;
+            have_nick = true;
+            break;
+        }
+        case 0x02:
+            if (tlv_len != sizeof(record->noise_key)) {
+                return false;
+            }
+            memcpy(record->noise_key, value, tlv_len);
+            have_noise = true;
+            break;
+        case 0x03:
+            if (tlv_len != sizeof(record->sign_key)) {
+                return false;
+            }
+            memcpy(record->sign_key, value, tlv_len);
+            have_sign = true;
+            break;
+        default:
+            break;
+        }
+    }
+    return have_nick && have_noise && have_sign;
+}
+
+/* Returns false when the sender ID is not derived from the announced Noise
+ * key (spoofed announce, hard reject). Sets *out_sig_ok when the packet
+ * signature verifies against the announced signing key. */
+static bool verify_announce_event(const noise_event_t *evt, const noise_identity_t *record, bool *out_sig_ok)
+{
+    *out_sig_ok = false;
+    uint8_t hash[32];
+    mbedtls_sha256(record->noise_key, sizeof(record->noise_key), hash, 0);
+    if (memcmp(hash, evt->peer_id, sizeof(evt->peer_id)) != 0) {
+        return false;
+    }
+    if (!evt->has_signature) {
+        return true;
+    }
+    bitchat_packet_t packet = {0};
+    packet.version = 1;
+    packet.type = BITCHAT_MSG_ANNOUNCE;
+    packet.timestamp_ms = evt->timestamp_ms;
+    memcpy(packet.sender_id, evt->peer_id, sizeof(packet.sender_id));
+    packet.payload = (uint8_t *)evt->payload;
+    packet.payload_len = evt->payload_len;
+
+    uint8_t canonical[BITCHAT_BLE_MAX_PACKET_SIZE];
+    size_t canonical_len = 0;
+    if (build_canonical_packet(&packet, canonical, &canonical_len, sizeof(canonical))) {
+        *out_sig_ok = ed25519_sign_open(canonical, canonical_len,
+                                        (unsigned char *)record->sign_key,
+                                        (unsigned char *)evt->signature) == 0;
+    }
+    return true;
+}
+
+/* BitChat transport payloads carry an explicit nonce (NoiseCipherState with
+ * useExtractedNonce=true): <4-byte BE nonce><ciphertext><16-byte tag>. */
+#define NOISE_TRANSPORT_NONCE_LEN 4
+
+static bool encrypt_payload(noise_session_t *session, const uint8_t *input, size_t input_len, uint8_t *output, size_t *output_len)
+{
+    if (!session || !session->tx_cipher || !output || !output_len ||
+        input_len + NOISE_TRANSPORT_NONCE_LEN > *output_len) {
+        return false;
+    }
+    uint32_t nonce = session->tx_nonce;
+    output[0] = (nonce >> 24) & 0xFF;
+    output[1] = (nonce >> 16) & 0xFF;
+    output[2] = (nonce >> 8) & 0xFF;
+    output[3] = nonce & 0xFF;
+    memcpy(output + NOISE_TRANSPORT_NONCE_LEN, input, input_len);
+    if (noise_cipherstate_set_nonce(session->tx_cipher, nonce) != NOISE_ERROR_NONE) {
+        return false;
+    }
     NoiseBuffer buffer;
-    noise_buffer_set_inout(buffer, output, input_len, *output_len);
+    noise_buffer_set_inout(buffer, output + NOISE_TRANSPORT_NONCE_LEN, input_len,
+                           *output_len - NOISE_TRANSPORT_NONCE_LEN);
     if (noise_cipherstate_encrypt(session->tx_cipher, &buffer) != NOISE_ERROR_NONE) {
         return false;
     }
-    *output_len = buffer.size;
+    session->tx_nonce = nonce + 1;
+    *output_len = buffer.size + NOISE_TRANSPORT_NONCE_LEN;
     return true;
 }
 
 static bool decrypt_payload(noise_session_t *session, const uint8_t *input, size_t input_len, uint8_t *output, size_t *output_len)
 {
-    if (!session || !session->rx_cipher || !output || !output_len || input_len > *output_len) {
+    if (!session || !session->rx_cipher || !output || !output_len ||
+        input_len <= NOISE_TRANSPORT_NONCE_LEN ||
+        input_len - NOISE_TRANSPORT_NONCE_LEN > *output_len) {
         return false;
     }
-    memcpy(output, input, input_len);
+    uint32_t nonce = ((uint32_t)input[0] << 24) | ((uint32_t)input[1] << 16) |
+                     ((uint32_t)input[2] << 8) | (uint32_t)input[3];
+    /* noise-c refuses backward nonces, which doubles as replay protection. */
+    if (noise_cipherstate_set_nonce(session->rx_cipher, nonce) != NOISE_ERROR_NONE) {
+        ESP_LOGW(TAG, "conn=%u rejected transport nonce %u (replay?)", session->conn_handle, (unsigned)nonce);
+        return false;
+    }
+    memcpy(output, input + NOISE_TRANSPORT_NONCE_LEN, input_len - NOISE_TRANSPORT_NONCE_LEN);
     NoiseBuffer buffer;
-    noise_buffer_set_inout(buffer, output, input_len, *output_len);
+    noise_buffer_set_inout(buffer, output, input_len - NOISE_TRANSPORT_NONCE_LEN, *output_len);
     if (noise_cipherstate_decrypt(session->rx_cipher, &buffer) != NOISE_ERROR_NONE) {
         return false;
     }
@@ -917,48 +1019,97 @@ static bool decrypt_payload(noise_session_t *session, const uint8_t *input, size
     return true;
 }
 
-static void handle_noise_payload(uint16_t conn_handle, const bitchat_packet_t *packet, noise_session_t *session, const uint8_t *decrypted, size_t decrypted_len)
+/* Random v4 UUID formatted like Foundation's UUID().uuidString. */
+static void generate_uuid_string(char *out, size_t out_len)
 {
-    (void)packet;
+    uint8_t raw[16];
+    esp_fill_random(raw, sizeof(raw));
+    raw[6] = (raw[6] & 0x0F) | 0x40;
+    raw[8] = (raw[8] & 0x3F) | 0x80;
+    snprintf(out, out_len,
+             "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+             raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+             raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15]);
+}
+
+static void send_auto_reply(noise_session_t *session)
+{
+    const char *text = BITLE_AUTO_REPLY_TEXT;
+    size_t text_len = strlen(text);
+    char message_id[37];
+    generate_uuid_string(message_id, sizeof(message_id));
+    size_t id_len = strlen(message_id);
+
+    /* PrivateMessagePacket TLVs: 0x00 messageID, 0x01 content. */
+    uint8_t payload[2 + sizeof(message_id) + 2 + sizeof(BITLE_AUTO_REPLY_TEXT)];
+    size_t offset = 0;
+    payload[offset++] = 0x00;
+    payload[offset++] = (uint8_t)id_len;
+    memcpy(payload + offset, message_id, id_len);
+    offset += id_len;
+    payload[offset++] = 0x01;
+    payload[offset++] = (uint8_t)text_len;
+    memcpy(payload + offset, text, text_len);
+    offset += text_len;
+
+    if (noise_send_encrypted(session->conn_handle, BITCHAT_NOISE_PAYLOAD_PRIVATE_MESSAGE, payload, offset)) {
+        session->auto_replied = true;
+        ESP_LOGI(TAG, "conn=%u auto-reply sent", session->conn_handle);
+    } else {
+        ESP_LOGW(TAG, "conn=%u auto-reply send failed", session->conn_handle);
+    }
+}
+
+static void handle_noise_payload(uint16_t conn_handle, const noise_event_t *evt, noise_session_t *session, const uint8_t *decrypted, size_t decrypted_len)
+{
+    (void)evt;
     if (!decrypted || decrypted_len == 0) {
         ESP_LOGW(TAG, "Encrypted payload from conn=%u is empty", conn_handle);
         return;
     }
     uint8_t payload_type = decrypted[0];
     ESP_LOGI(TAG, "Encrypted payload type=0x%02X len=%u", payload_type, (unsigned)(decrypted_len - 1));
-    (void)session;
-}
-
-static void handle_version(uint16_t conn_handle, const bitchat_packet_t *packet)
-{
-    if (!packet->payload || packet->payload_len < 2) {
-        ESP_LOGW(TAG, "Invalid version payload");
-        return;
-    }
-    uint8_t flags = packet->payload[0];
-    uint8_t version = packet->payload[1];
-
-    noise_session_t *session = find_session(conn_handle);
-    if (!session) {
-        ESP_LOGW(TAG, "Version message on unknown conn=%u", conn_handle);
+    if (payload_type != BITCHAT_NOISE_PAYLOAD_PRIVATE_MESSAGE) {
         return;
     }
 
-    ESP_LOGI(TAG, "Version flags=0x%02X version=%u", flags, version);
-
-    if (!send_version_message(session, BITCHAT_MSG_VERSION_ACK, flags, version)) {
-        ESP_LOGW(TAG, "Failed to send version ack for conn=%u", conn_handle);
-    } else {
-        ESP_LOGI(TAG, "conn=%u version ack sent", conn_handle);
-    }
-
-    size_t idx = session - s_sessions;
-    if (session->tx_cipher && session->rx_cipher && idx < NOISE_MAX_SESSIONS && s_identity_pending[idx]) {
-        if (!send_identity_announce(session)) {
-            ESP_LOGW(TAG, "Failed to send pending identity conn=%u", conn_handle);
+    /* PrivateMessagePacket TLVs: 0x00 messageID, 0x01 content. */
+    const uint8_t *p = decrypted + 1;
+    size_t len = decrypted_len - 1;
+    size_t offset = 0;
+    char message_id[64] = {0};
+    while (offset + 2 <= len) {
+        uint8_t tlv_type = p[offset++];
+        uint8_t tlv_len = p[offset++];
+        if (offset + tlv_len > len) {
+            break;
         }
-    } else if (!session->tx_cipher || !session->rx_cipher) {
-        ESP_LOGI(TAG, "conn=%u deferring identity until Noise established", conn_handle);
+        if (tlv_type == 0x00 && tlv_len < sizeof(message_id)) {
+            memcpy(message_id, p + offset, tlv_len);
+            message_id[tlv_len] = '\0';
+        } else if (tlv_type == 0x01) {
+            char content[256];
+            size_t copy_len = tlv_len < sizeof(content) - 1 ? tlv_len : sizeof(content) - 1;
+            memcpy(content, p + offset, copy_len);
+            content[copy_len] = '\0';
+            ESP_LOGI(TAG, "PRIVATE message on conn=%u: %s", conn_handle, content);
+        }
+        offset += tlv_len;
+    }
+
+    /* Delivery ack (payload = raw messageID string) puts the checkmark on
+     * the sender's phone. */
+    if (message_id[0] != '\0') {
+        if (!noise_send_encrypted(conn_handle, BITCHAT_NOISE_PAYLOAD_DELIVERED,
+                                  (const uint8_t *)message_id, strlen(message_id))) {
+            ESP_LOGW(TAG, "conn=%u delivery ack failed", conn_handle);
+        }
+    }
+
+    /* One informational auto-reply per session, so a chatty sender (or
+     * another bot) cannot ping-pong with us. */
+    if (session && !session->auto_replied) {
+        send_auto_reply(session);
     }
 }
 
@@ -976,38 +1127,19 @@ static void format_hex(const uint8_t *data, size_t len, char *out, size_t out_le
     out[len * 2] = '\0';
 }
 
-static bool send_version_message(noise_session_t *session, uint8_t type, uint8_t flags, uint8_t version)
-{
-    if (!session) {
-        return false;
-    }
-    if (!session->established && type == BITCHAT_MSG_VERSION_HELLO) {
-        return true;
-    }
-    uint8_t payload[2] = {flags, version};
-    const uint8_t *recipient = (type == BITCHAT_MSG_VERSION_HELLO) ? NULL : session->peer_id;
-    if (type == BITCHAT_MSG_VERSION_HELLO) {
-        ESP_LOGI(TAG, "conn=%u sending VERSION_HELLO broadcast", session->conn_handle);
-    }
-    return encode_and_send(session->conn_handle, type, recipient, payload, sizeof(payload), true) == ESP_OK;
-}
-
 static esp_err_t encode_and_send(uint16_t conn_handle, bitchat_message_type_t type, const uint8_t *recipient_id, const uint8_t *payload, size_t payload_len, bool sign)
 {
     bitchat_packet_t packet;
     memset(&packet, 0, sizeof(packet));
     packet.version = 1;
     packet.type = type;
-    if (type == BITCHAT_MSG_NOISE_HANDSHAKE) {
-        packet.ttl = 0;
-        packet.timestamp_ms = 0;
-    } else {
-        packet.ttl = NOISE_PACKET_TTL;
-        packet.timestamp_ms = bitchat_time_now_ms();
-        if (!packet.timestamp_ms) {
-            ESP_LOGW(TAG, "Skipping send; timestamp invalid for type=0x%02X", type);
-            return ESP_ERR_INVALID_STATE;
-        }
+    /* Every packet needs a live timestamp: iOS validates ±120 s of skew on
+     * all inbound packets, handshakes included. */
+    packet.ttl = NOISE_PACKET_TTL;
+    packet.timestamp_ms = bitchat_time_now_ms();
+    if (!packet.timestamp_ms) {
+        ESP_LOGW(TAG, "Skipping send; timestamp invalid for type=0x%02X", type);
+        return ESP_ERR_INVALID_STATE;
     }
     memcpy(packet.sender_id, s_peer_id, sizeof(packet.sender_id));
     if (recipient_id) {
@@ -1032,16 +1164,14 @@ static esp_err_t encode_and_send(uint16_t conn_handle, bitchat_message_type_t ty
     return bitchat_ble_send(conn_handle, buffer, encoded_len);
 }
 
-static esp_err_t queue_event(const noise_event_t *evt)
+static esp_err_t queue_event(const noise_event_t *evt, TickType_t wait_ticks)
 {
     if (!s_event_queue) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (xQueueSend(s_event_queue, evt, 0) != pdTRUE) {
+    if (xQueueSend(s_event_queue, evt, wait_ticks) != pdTRUE) {
+        ESP_LOGW(TAG, "Event queue full; dropping type=%d conn=%u", evt->type, evt->conn_handle);
         return ESP_ERR_TIMEOUT;
-    }
-    if (s_task_handle) {
-        xTaskNotifyGive(s_task_handle);
     }
     return ESP_OK;
 }
@@ -1051,13 +1181,9 @@ static bool enqueue_event(noise_evt_type_t type, uint16_t conn_handle, const uin
     if (!init_worker()) {
         return false;
     }
-    if (payload_len > NOISE_MESSAGE_MAX) {
-        ESP_LOGW(TAG, "Dropping handshake payload too large (%u)", payload_len);
+    if (payload_len > NOISE_EVENT_PAYLOAD_MAX) {
+        ESP_LOGW(TAG, "Dropping event type=%d payload too large (%u)", type, payload_len);
         return false;
-    }
-    ESP_LOGI(TAG, "queue %s conn=%u payload_len=%u", type == NOISE_EVT_START ? "start" : "process", conn_handle, payload_len);
-    if (payload && payload_len) {
-        ESP_LOG_BUFFER_HEXDUMP(TAG, payload, payload_len, ESP_LOG_INFO);
     }
     noise_event_t evt = {
         .type = type,
@@ -1071,7 +1197,36 @@ static bool enqueue_event(noise_evt_type_t type, uint16_t conn_handle, const uin
     if (payload && payload_len) {
         memcpy(evt.payload, payload, payload_len);
     }
-    return queue_event(&evt) == ESP_OK;
+    return queue_event(&evt, 0) == ESP_OK;
+}
+
+/* Copies the fields the worker needs from a decoded packet, including the
+ * pieces required to re-verify the packet signature off the host task. */
+static bool enqueue_packet_event(noise_evt_type_t type, uint16_t conn_handle, const bitchat_packet_t *packet)
+{
+    if (!init_worker()) {
+        return false;
+    }
+    if (packet->payload_len > NOISE_EVENT_PAYLOAD_MAX) {
+        ESP_LOGW(TAG, "Dropping type=0x%02X payload too large (%u)", packet->type, packet->payload_len);
+        return false;
+    }
+    noise_event_t evt = {
+        .type = type,
+        .conn_handle = conn_handle,
+        .timestamp_ms = packet->timestamp_ms,
+        .ttl = packet->ttl,
+        .has_signature = packet->has_signature,
+        .payload_len = packet->payload_len,
+    };
+    memcpy(evt.peer_id, packet->sender_id, sizeof(evt.peer_id));
+    if (packet->has_signature) {
+        memcpy(evt.signature, packet->signature, sizeof(evt.signature));
+    }
+    if (packet->payload && packet->payload_len) {
+        memcpy(evt.payload, packet->payload, packet->payload_len);
+    }
+    return queue_event(&evt, 0) == ESP_OK;
 }
 
 static void handshake_task(void *arg)
@@ -1079,44 +1234,65 @@ static void handshake_task(void *arg)
     (void)arg;
     noise_event_t evt;
     while (true) {
-        if (xQueueReceive(s_event_queue, &evt, portMAX_DELAY) != pdTRUE) {
-            continue;
-        }
-        switch (evt.type) {
-        case NOISE_EVT_START: {
-            noise_session_t *session = alloc_session(evt.conn_handle);
-            if (!session) {
-                ESP_LOGW(TAG, "No free session slots for conn=%u", evt.conn_handle);
-                break;
-            }
-            if (session->handshake) {
-                ESP_LOGI(TAG, "conn=%u handshake already active", evt.conn_handle);
-                break;
-            }
-            if (!start_handshake(session, &evt)) {
-                ESP_LOGW(TAG, "Handshake start failed for conn=%u", evt.conn_handle);
-                free_session(session);
-            }
-            break;
-        }
-        case NOISE_EVT_PROCESS: {
-            noise_session_t *session = find_session(evt.conn_handle);
-            if (!session) {
-                session = alloc_session(evt.conn_handle);
+        /* All session state is owned by this task; the timeout keeps the
+         * periodic maintenance running even when no packets arrive. */
+        if (xQueueReceive(s_event_queue, &evt, pdMS_TO_TICKS(500)) == pdTRUE) {
+            switch (evt.type) {
+            case NOISE_EVT_START: {
+                noise_session_t *session = alloc_session(evt.conn_handle);
                 if (!session) {
-                    ESP_LOGW(TAG, "No session available for incoming handshake conn=%u", evt.conn_handle);
+                    ESP_LOGW(TAG, "No free session slots for conn=%u", evt.conn_handle);
                     break;
                 }
+                if (session->handshake) {
+                    ESP_LOGI(TAG, "conn=%u handshake already active", evt.conn_handle);
+                    break;
+                }
+                if (!start_handshake(session, &evt)) {
+                    ESP_LOGW(TAG, "Handshake start failed for conn=%u", evt.conn_handle);
+                    free_session(session);
+                }
+                break;
             }
-            memcpy(session->peer_id, evt.peer_id, sizeof(session->peer_id));
-            if (!process_handshake(session, &evt)) {
-                ESP_LOGW(TAG, "Handshake processing failed for conn=%u", evt.conn_handle);
-                free_session(session);
+            case NOISE_EVT_PROCESS: {
+                noise_session_t *session = find_session(evt.conn_handle);
+                if (!session) {
+                    session = alloc_session(evt.conn_handle);
+                    if (!session) {
+                        ESP_LOGW(TAG, "No session available for incoming handshake conn=%u", evt.conn_handle);
+                        break;
+                    }
+                }
+                memcpy(session->peer_id, evt.peer_id, sizeof(session->peer_id));
+                if (!process_handshake(session, &evt)) {
+                    ESP_LOGW(TAG, "Handshake processing failed for conn=%u", evt.conn_handle);
+                    free_session(session);
+                }
+                break;
             }
-            break;
-        }
-        default:
-            break;
+            case NOISE_EVT_ANNOUNCE:
+                process_announce_event(&evt);
+                break;
+            case NOISE_EVT_IDENTITY:
+                process_identity_event(&evt);
+                break;
+            case NOISE_EVT_ENCRYPTED:
+                process_encrypted_event(&evt);
+                break;
+            case NOISE_EVT_SUBSCRIBED:
+                process_subscribed_event(&evt);
+                break;
+            case NOISE_EVT_DISCONNECT: {
+                noise_session_t *session = find_session(evt.conn_handle);
+                if (session) {
+                    ESP_LOGI(TAG, "Resetting session conn=%u", evt.conn_handle);
+                    free_session(session);
+                }
+                break;
+            }
+            default:
+                break;
+            }
         }
         poll_session_maintenance();
     }
@@ -1141,6 +1317,9 @@ static bool init_worker(void)
     return true;
 }
 
+/* --- Host-task entry points: everything is marshalled onto the worker task
+ * via the event queue so session state has a single owner. --- */
+
 void noise_handle_handshake(uint16_t conn_handle, const bitchat_packet_t *packet)
 {
     enqueue_event(NOISE_EVT_PROCESS, conn_handle, packet->sender_id, false, packet->payload, packet->payload_len);
@@ -1148,50 +1327,151 @@ void noise_handle_handshake(uint16_t conn_handle, const bitchat_packet_t *packet
 
 void noise_handle_identity_announce(uint16_t conn_handle, const bitchat_packet_t *packet)
 {
+    enqueue_packet_event(NOISE_EVT_IDENTITY, conn_handle, packet);
+}
+
+void noise_handle_announce(uint16_t conn_handle, const bitchat_packet_t *packet)
+{
+    enqueue_packet_event(NOISE_EVT_ANNOUNCE, conn_handle, packet);
+}
+
+void noise_handle_encrypted(uint16_t conn_handle, const bitchat_packet_t *packet)
+{
+    enqueue_packet_event(NOISE_EVT_ENCRYPTED, conn_handle, packet);
+}
+
+void noise_notify_subscribed(uint16_t conn_handle)
+{
+    enqueue_event(NOISE_EVT_SUBSCRIBED, conn_handle, NULL, false, NULL, 0);
+}
+
+/* --- Worker-task processors --- */
+
+static void process_announce_event(const noise_event_t *evt)
+{
+    uint16_t conn_handle = evt->conn_handle;
+    /* Announces relayed from further hops share this link but describe other
+     * peers; only direct announces (original TTL) identify the link peer. */
+    bool is_direct = evt->ttl == NOISE_PACKET_TTL;
+    noise_identity_t ident = {0};
+
+    if (parse_announce_tlv(evt->payload, evt->payload_len, &ident)) {
+        bool sig_ok = false;
+        if (!verify_announce_event(evt, &ident, &sig_ok)) {
+            ESP_LOGW(TAG, "conn=%u ANNOUNCE sender not derived from announced key; dropping", conn_handle);
+            return;
+        }
+        if (evt->has_signature && !sig_ok) {
+            /* Older clients sign with a different scheme; keep the peer but
+             * leave it unverified rather than breaking interop. */
+            ESP_LOGW(TAG, "conn=%u ANNOUNCE signature did not verify", conn_handle);
+        }
+        if (is_direct) {
+            noise_session_t *session = alloc_session(conn_handle);
+            if (session) {
+                size_t idx = session - s_sessions;
+                ident.valid = true;
+                ident.verified = sig_ok;
+                ident.timestamp_ms = evt->timestamp_ms;
+                memcpy(ident.peer_id, evt->peer_id, sizeof(ident.peer_id));
+                if (!s_identities[idx].verified || sig_ok) {
+                    s_identities[idx] = ident;
+                }
+                session->direct_peer = true;
+                const uint8_t zero_id[8] = {0};
+                if (memcmp(session->peer_id, zero_id, sizeof(zero_id)) == 0) {
+                    memcpy(session->peer_id, evt->peer_id, sizeof(session->peer_id));
+                }
+            }
+        }
+        ESP_LOGI(TAG, "conn=%u peer '%s' announced (%s%s)", conn_handle, ident.nickname,
+                 sig_ok ? "verified" : "unverified", is_direct ? "" : ", relayed");
+    } else {
+        ESP_LOGW(TAG, "conn=%u ANNOUNCE TLV parse failed", conn_handle);
+    }
+
     noise_session_t *session = find_session(conn_handle);
+    if (session && !session->identity_sent) {
+        size_t idx = session - s_sessions;
+        s_identity_pending[idx] = true;
+        try_send_identity(session);
+    }
+    /* Lazy handshake, like the mobile clients: never initiate a Noise
+     * session on announce. Phones initiate when a private message needs
+     * one; a relay pre-initiating leaves stuck pending sessions on the
+     * peer and blocks their DM path. We answer as responder only. */
+}
+
+static void process_identity_event(const noise_event_t *evt)
+{
+    noise_session_t *session = alloc_session(evt->conn_handle);
     if (!session) {
-        ESP_LOGW(TAG, "Identity announce for unknown conn=%u", conn_handle);
+        ESP_LOGW(TAG, "No session slot for identity announce conn=%u", evt->conn_handle);
         return;
     }
     size_t index = session - s_sessions;
     if (index >= NOISE_MAX_SESSIONS) {
         return;
     }
-    if (parse_identity(packet, &s_identities[index])) {
-        ESP_LOGI(TAG, "Stored identity for conn=%u", conn_handle);
-        session->peer_identity_seen = true;
-        session->fallback_deadline_ms = 0;
+    noise_identity_t ident = {0};
+    if (parse_identity_payload(evt->payload, evt->payload_len, &ident)) {
+        ESP_LOGI(TAG, "Stored legacy identity for conn=%u", evt->conn_handle);
+        if (!s_identities[index].verified) {
+            memcpy(ident.peer_id, evt->peer_id, sizeof(ident.peer_id));
+            s_identities[index] = ident;
+        }
+        const uint8_t zero_id[8] = {0};
+        if (memcmp(session->peer_id, zero_id, sizeof(zero_id)) == 0) {
+            /* Relayed identity announces can arrive for other peers in the
+             * mesh; only bind the direct peer while it is still unknown. */
+            memcpy(session->peer_id, evt->peer_id, sizeof(session->peer_id));
+        }
         try_send_identity(session);
     }
 }
 
-void noise_notify_subscribed(uint16_t conn_handle)
+static void process_encrypted_event(const noise_event_t *evt)
 {
-    noise_session_t *session = find_session_by_conn(conn_handle);
-    if (!session) {
-        return;
-    }
-}
-
-void noise_handle_encrypted(uint16_t conn_handle, const bitchat_packet_t *packet)
-{
-    noise_session_t *session = find_session(conn_handle);
+    noise_session_t *session = find_session(evt->conn_handle);
     if (!session || !session->established) {
-        ESP_LOGW(TAG, "Encrypted payload without session for conn=%u", conn_handle);
+        /* The peer kept a session across our reboot. Mirror the mobile
+         * clients: initiate a fresh handshake so the link recovers. */
+        ESP_LOGW(TAG, "Encrypted payload without session for conn=%u; re-handshaking", evt->conn_handle);
+        if (!session || !session->handshake) {
+            noise_begin_handshake(evt->conn_handle, evt->peer_id, NULL);
+        }
         return;
     }
     uint8_t plaintext[NOISE_MAX_ENCRYPTED_PAYLOAD];
     size_t plaintext_len = sizeof(plaintext);
-    if (!decrypt_payload(session, packet->payload, packet->payload_len, plaintext, &plaintext_len)) {
-        ESP_LOGW(TAG, "Decrypt failed for conn=%u", conn_handle);
+    if (!decrypt_payload(session, evt->payload, evt->payload_len, plaintext, &plaintext_len)) {
+        ESP_LOGW(TAG, "Decrypt failed for conn=%u", evt->conn_handle);
         return;
     }
-    handle_noise_payload(conn_handle, packet, session, plaintext, plaintext_len);
+    handle_noise_payload(evt->conn_handle, evt, session, plaintext, plaintext_len);
 }
 
-void noise_handle_version_message(uint16_t conn_handle, const bitchat_packet_t *packet)
+static void process_subscribed_event(const noise_event_t *evt)
 {
-    handle_version(conn_handle, packet);
+    noise_session_t *existing = find_session(evt->conn_handle);
+    if (existing) {
+        /* A fresh subscription means a fresh link; drop any state left over
+         * from a previous connection that reused this handle. */
+        free_session(existing);
+    }
+    noise_session_t *session = alloc_session(evt->conn_handle);
+    if (!session) {
+        ESP_LOGW(TAG, "No session slot for subscriber conn=%u", evt->conn_handle);
+        return;
+    }
+    size_t idx = session - s_sessions;
+    if (idx < NOISE_MAX_SESSIONS) {
+        s_identity_pending[idx] = true;
+    }
+    /* Speak first: iOS stays silent toward peers it has not verified, so
+     * first contact must come from us. */
+    ESP_LOGI(TAG, "conn=%u subscribed; sending initial announce", evt->conn_handle);
+    try_send_identity(session);
 }
 
 void noise_handle_public_message(uint16_t conn_handle, const bitchat_packet_t *packet)
@@ -1208,10 +1488,17 @@ void noise_handle_public_message(uint16_t conn_handle, const bitchat_packet_t *p
 
 void noise_reset_connection(uint16_t conn_handle)
 {
-    noise_session_t *session = find_session(conn_handle);
-    if (session) {
-        ESP_LOGI(TAG, "Resetting session conn=%u", conn_handle);
-        free_session(session);
+    if (!init_worker()) {
+        return;
+    }
+    noise_event_t evt = {
+        .type = NOISE_EVT_DISCONNECT,
+        .conn_handle = conn_handle,
+    };
+    /* Wait briefly rather than drop: a lost disconnect would leak the
+     * session slot until the conn handle is reused. */
+    if (queue_event(&evt, pdMS_TO_TICKS(100)) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to queue disconnect for conn=%u", conn_handle);
     }
 }
 
@@ -1272,7 +1559,8 @@ bool noise_post_handshake_event(noise_evt_type_t type, uint16_t conn_handle, con
 
 void noise_poll(void)
 {
-    poll_session_maintenance();
+    /* Session maintenance runs on the worker task's receive timeout; nothing
+     * to do here. Kept for API compatibility with the main loop. */
 }
 
 esp_err_t bitchat_noise_init(void)
@@ -1288,59 +1576,54 @@ esp_err_t bitchat_noise_init(void)
 
 static void poll_session_maintenance(void)
 {
-    uint64_t now = bitchat_time_now_ms();
-    if (!now) {
-        now = esp_timer_get_time() / 1000ULL;
+    static uint64_t s_last_maintenance_ms;
+    uint64_t uptime = esp_timer_get_time() / 1000ULL;
+    if (uptime - s_last_maintenance_ms < 500) {
+        return;
     }
-
+    s_last_maintenance_ms = uptime;
     bool time_ok = bitchat_time_is_valid();
+    uint32_t sync_gen = bitchat_time_sync_generation();
 
     for (size_t i = 0; i < NOISE_MAX_SESSIONS; ++i) {
         noise_session_t *session = &s_sessions[i];
-        if (!session->in_use || !session->established) {
+        if (!session->in_use) {
             continue;
+        }
+        if (!bitchat_ble_conn_subscribed(session->conn_handle)) {
+            continue; /* mute link; nothing we send can arrive */
         }
         if (s_identity_pending[i]) {
             try_send_identity(session);
         }
-        if (session->last_announce_ms == 0 || (now - session->last_announce_ms) >= ANNOUNCE_INTERVAL_MS) {
+        /* Proactively establish a session with the direct peer. Upstream
+         * treats a fresh 32-byte initiation as "the other side restarted":
+         * it resets any stuck session and, on re-establishment, flushes the
+         * peer's queued private messages toward us. */
+        if (session->direct_peer && session->identity_sent &&
+            !session->established && !session->handshake &&
+            session->hs_attempts < 3 && uptime >= session->next_hs_ms) {
+            session->hs_attempts++;
+            session->next_hs_ms = uptime + 15000;
+            ESP_LOGI(TAG, "conn=%u initiating session with direct peer (attempt %u)",
+                     session->conn_handle, session->hs_attempts);
+            noise_begin_handshake(session->conn_handle, session->peer_id, NULL);
+        }
+        if (session->identity_sent && session->sent_sync_gen != sync_gen) {
+            /* Clock was corrected after our identity went out; the previous
+             * announce carried a stale timestamp that iOS silently rejects.
+             * Re-send with the freshly synced clock. */
+            ESP_LOGI(TAG, "conn=%u clock re-synced; re-announcing identity", session->conn_handle);
+            if (send_announce(session) && send_identity_announce(session)) {
+                session->sent_sync_gen = sync_gen;
+            }
+            continue;
+        }
+        if (session->last_announce_ms == 0 || (uptime - session->last_announce_ms) >= ANNOUNCE_INTERVAL_MS) {
             if (time_ok && send_announce(session)) {
-                session->last_announce_ms = now;
+                session->last_announce_ms = uptime;
             }
-        }
-        if (!session->identity_sent && session->fallback_deadline_ms && now >= session->fallback_deadline_ms) {
-            ESP_LOGW(TAG, "conn=%u identity fallback fired", session->conn_handle);
-            session->fallback_deadline_ms = 0;
-            try_send_identity(session);
         }
     }
 }
 
-void noise_handle_announce(uint16_t conn_handle, const bitchat_packet_t *packet)
-{
-    consider_packet_timestamp(packet);
-    noise_session_t *session = find_session(conn_handle);
-    if (session) {
-        if (session->handshake || session->established) {
-            ESP_LOGI(TAG, "conn=%u ANNOUNCE ignored; session already active", conn_handle);
-            if (!session->identity_sent && bitchat_time_is_valid()) {
-                session->peer_identity_seen = true;
-                try_send_identity(session);
-            }
-            return;
-        }
-    }
-    if (!noise_can_begin_handshake(conn_handle)) {
-        ESP_LOGI(TAG, "conn=%u ANNOUNCE ignored; handshake pending", conn_handle);
-        return;
-    }
-    noise_begin_handshake(conn_handle, packet->sender_id, (const char *)packet->payload);
-}
-
-static void consider_packet_timestamp(const bitchat_packet_t *packet)
-{
-    if (!packet || !packet->timestamp_ms) {
-        return;
-    }
-    bitchat_time_consider_peer(packet->timestamp_ms);
-}

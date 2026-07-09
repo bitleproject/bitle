@@ -4,9 +4,33 @@
 #include "esp_heap_caps.h"
 #include <string.h>
 
+#include "miniz.h"
+
 #include "bitchat_ble.h"
 
 static const char *TAG = "packet_codec";
+
+/* Apple's COMPRESSION_ZLIB emits raw DEFLATE (RFC 1951, no zlib wrapper);
+ * the ESP32-C3 ROM ships tinfl, so inflation costs no flash. */
+static tinfl_decompressor s_inflator;
+
+static uint8_t *inflate_payload(const uint8_t *in, size_t in_len, size_t out_len)
+{
+    uint8_t *out = heap_caps_malloc(out_len, MALLOC_CAP_8BIT);
+    if (!out) {
+        return NULL;
+    }
+    tinfl_init(&s_inflator);
+    size_t consumed = in_len;
+    size_t produced = out_len;
+    tinfl_status status = tinfl_decompress(&s_inflator, in, &consumed, out, out, &produced,
+                                           TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+    if (status != TINFL_STATUS_DONE || produced != out_len) {
+        heap_caps_free(out);
+        return NULL;
+    }
+    return out;
+}
 
 static uint8_t read_u8(const uint8_t *data, size_t len, size_t *offset, bool *ok)
 {
@@ -74,6 +98,10 @@ bool bitchat_packet_decode(const uint8_t *data, size_t len, bitchat_packet_t *ou
     memcpy(out_packet->sender_id, data + offset, sizeof(out_packet->sender_id));
     offset += 8;
 
+    /* zlib-compressed payload (flag 0x04): we cannot inflate it locally, but
+     * the header and raw bytes stay usable for time sync and relaying. */
+    out_packet->is_compressed = (flags & 0x04) != 0;
+
     if (flags & 0x01) {
         out_packet->has_recipient = true;
         if (offset + sizeof(out_packet->recipient_id) > len) {
@@ -99,6 +127,24 @@ bool bitchat_packet_decode(const uint8_t *data, size_t len, bitchat_packet_t *ou
     }
     out_packet->payload_len = payload_len;
     offset += payload_len;
+
+    /* Compressed payload (v1): [2-byte original size BE][raw deflate]. On
+     * success the packet becomes a normal one; on failure it stays marked
+     * compressed and is handled relay-only. */
+    if (out_packet->is_compressed && payload_len > 2) {
+        uint16_t original_len = ((uint16_t)out_packet->payload[0] << 8) | out_packet->payload[1];
+        if (original_len > 0) {
+            uint8_t *inflated = inflate_payload(out_packet->payload + 2, payload_len - 2, original_len);
+            if (inflated) {
+                heap_caps_free(out_packet->payload);
+                out_packet->payload = inflated;
+                out_packet->payload_len = original_len;
+                out_packet->is_compressed = false;
+            } else {
+                ESP_LOGW(TAG, "Failed to inflate payload (%u -> %u)", payload_len, original_len);
+            }
+        }
+    }
 
     if (flags & 0x02) {
         out_packet->has_signature = true;

@@ -20,6 +20,7 @@ static void bitle_main_task(void *arg)
     while (true) {
         bitchat_ble_poll();
         noise_poll();
+        bitchat_time_poll();
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
