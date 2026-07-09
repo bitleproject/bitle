@@ -1,9 +1,12 @@
-# Bitle OTA partition layout (2 MB flash).
+# Bitle OTA partition layout (4 MB flash).
 # nvs and phy_init keep the stock offsets so identity keys, nickname and
-# clock state survive the migration from the single-factory layout.
-# Name,    Type, SubType, Offset,   Size
-nvs,       data, nvs,     0x9000,   0x6000
-phy_init,  data, phy,     0xf000,   0x1000
-otadata,   data, ota,     0x10000,  0x2000
-ota_0,     app,  ota_0,   0x20000,  0xF0000
-ota_1,     app,  ota_1,   0x110000, 0xF0000
+# clock state survive the migration. fw_manifest holds the 110-byte signed
+# release manifest, flashed alongside the image so a wire-flashed node can
+# serve its own firmware to peers without any BLE push tool.
+# Name,        Type, SubType, Offset,   Size
+nvs,           data, nvs,     0x9000,   0x6000
+phy_init,      data, phy,     0xf000,   0x1000
+otadata,       data, ota,     0x10000,  0x2000
+fw_manifest,   data, 0x40,    0x12000,  0x1000
+ota_0,         app,  ota_0,   0x20000,  0x1C0000
+ota_1,         app,  ota_1,   0x1E0000, 0x1C0000

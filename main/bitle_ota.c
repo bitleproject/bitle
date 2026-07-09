@@ -390,6 +390,38 @@ static void ota_task(void *arg)
     }
 }
 
+/* A wire-flashed node has no signed manifest for its running image and so
+ * cannot serve peers. The release manifest is flashed into the fw_manifest
+ * partition alongside the image; adopt it here (after verifying signature
+ * and that it describes our running image) so the node serves immediately. */
+static void adopt_manifest_from_partition(void)
+{
+    const esp_partition_t *part =
+        esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0x40, "fw_manifest");
+    if (!part) {
+        return;
+    }
+    uint8_t raw[OTA_MANIFEST_LEN];
+    if (esp_partition_read(part, 0, raw, sizeof(raw)) != ESP_OK ||
+        memcmp(raw, OTA_MAGIC, 4) != 0) {
+        return;
+    }
+    ota_manifest_t manifest;
+    if (!parse_manifest(raw, sizeof(raw), &manifest)) {
+        return;
+    }
+    if (manifest.version != BITLE_FW_VERSION) {
+        return;
+    }
+    if (hash_matches_running_image(&manifest)) {
+        store_serve_manifest(&manifest);
+        ESP_LOGI(TAG, "Adopted flashed manifest for running image v%lu; serving",
+                 (unsigned long)manifest.version);
+    } else {
+        ESP_LOGW(TAG, "fw_manifest partition does not match running image; ignoring");
+    }
+}
+
 void bitle_ota_handle_packet(uint16_t conn_handle, const bitchat_packet_t *packet)
 {
     if (!s_queue || !packet->payload || packet->payload_len > sizeof(((ota_event_t *)0)->payload)) {
@@ -462,6 +494,10 @@ esp_err_t bitle_ota_init(void)
             }
         }
         nvs_close(handle);
+    }
+
+    if (!s_can_serve) {
+        adopt_manifest_from_partition();
     }
 
     s_queue = xQueueCreate(OTA_QUEUE_DEPTH, sizeof(ota_event_t));

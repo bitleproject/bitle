@@ -1406,6 +1406,29 @@ static void process_announce_event(const noise_event_t *evt)
                 if (memcmp(session->peer_id, zero_id, sizeof(zero_id)) == 0) {
                     memcpy(session->peer_id, evt->peer_id, sizeof(session->peer_id));
                 }
+                /* Two Bitles can dial each other simultaneously, wasting a
+                 * slot on a duplicate link. The higher peer ID hangs up its
+                 * own outbound leg, leaving exactly one link. */
+                for (size_t i = 0; i < NOISE_MAX_SESSIONS; ++i) {
+                    noise_session_t *other = &s_sessions[i];
+                    if (other == session || !other->in_use ||
+                        memcmp(other->peer_id, evt->peer_id, sizeof(other->peer_id)) != 0) {
+                        continue;
+                    }
+                    if (memcmp(s_peer_id, evt->peer_id, sizeof(s_peer_id)) > 0) {
+                        uint16_t victim = 0xFFFF;
+                        if (bitchat_ble_conn_is_central(session->conn_handle)) {
+                            victim = session->conn_handle;
+                        } else if (bitchat_ble_conn_is_central(other->conn_handle)) {
+                            victim = other->conn_handle;
+                        }
+                        if (victim != 0xFFFF) {
+                            ESP_LOGI(TAG, "Duplicate link to peer; dropping our central conn=%u", victim);
+                            bitchat_ble_disconnect(victim);
+                        }
+                    }
+                    break;
+                }
             }
         }
         ESP_LOGI(TAG, "conn=%u peer '%s' announced (%s%s)", conn_handle, ident.nickname,

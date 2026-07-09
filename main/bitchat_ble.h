@@ -18,6 +18,8 @@ void bitchat_ble_poll(void);
 esp_err_t bitchat_ble_send(uint16_t conn_handle, const uint8_t *data, size_t len);
 esp_err_t bitchat_ble_send_with_ack(uint16_t conn_handle, const uint8_t *data, size_t len);
 bool bitchat_ble_conn_subscribed(uint16_t conn_handle);
+bool bitchat_ble_conn_is_central(uint16_t conn_handle);
+void bitchat_ble_disconnect(uint16_t conn_handle);
 
 #ifdef __cplusplus
 }

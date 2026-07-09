@@ -35,12 +35,83 @@ static uint8_t s_own_addr_type;
 typedef struct {
     bool in_use;
     bool subscribed;
+    bool is_central;              /* we dialed this link (peer is another Bitle) */
     uint16_t conn_handle;
+    uint16_t remote_val_handle;   /* peer's TX/RX characteristic (central links) */
+    uint16_t svc_end_handle;
+    ble_addr_t peer_addr;
     uint64_t connected_at_ms;
 } ble_conn_state_t;
 
 static ble_conn_state_t s_connections[BITLE_BLE_MAX_CONNECTIONS];
 static int gap_event_cb(struct ble_gap_event *event, void *arg);
+static void start_advertising(void);
+static void central_start_discovery(uint16_t conn_handle);
+
+/* Keep room for phones: at most this many outbound bitle-to-bitle links,
+ * and never dial unless at least two slots stay free for inbound centrals. */
+#define BITLE_CENTRAL_MAX_LINKS   2
+#define BITLE_CENTRAL_RESERVE     2
+#define BITLE_SCAN_INTERVAL_MS    60000ULL
+#define BITLE_SCAN_DURATION_MS    5000
+#define BITLE_DENY_TTL_MS         120000ULL
+
+typedef struct {
+    bool in_use;
+    ble_addr_t addr;
+    uint64_t until_ms;
+} deny_entry_t;
+
+static deny_entry_t s_deny[4];
+
+static size_t count_connections(bool centrals_only)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < BITLE_BLE_MAX_CONNECTIONS; ++i) {
+        if (s_connections[i].in_use && (!centrals_only || s_connections[i].is_central)) {
+            n++;
+        }
+    }
+    return n;
+}
+
+static bool addr_denied(const ble_addr_t *addr, uint64_t now)
+{
+    for (size_t i = 0; i < sizeof(s_deny) / sizeof(s_deny[0]); ++i) {
+        if (s_deny[i].in_use && now < s_deny[i].until_ms &&
+            ble_addr_cmp(&s_deny[i].addr, addr) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void deny_addr(const ble_addr_t *addr, uint64_t now)
+{
+    deny_entry_t *slot = &s_deny[0];
+    for (size_t i = 0; i < sizeof(s_deny) / sizeof(s_deny[0]); ++i) {
+        if (!s_deny[i].in_use || now >= s_deny[i].until_ms) {
+            slot = &s_deny[i];
+            break;
+        }
+        if (s_deny[i].until_ms < slot->until_ms) {
+            slot = &s_deny[i];
+        }
+    }
+    slot->in_use = true;
+    slot->addr = *addr;
+    slot->until_ms = now + BITLE_DENY_TTL_MS;
+}
+
+static bool already_linked_to(const ble_addr_t *addr)
+{
+    for (size_t i = 0; i < BITLE_BLE_MAX_CONNECTIONS; ++i) {
+        if (s_connections[i].in_use && ble_addr_cmp(&s_connections[i].peer_addr, addr) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 /* BitChat mainnet service F47B5E2D-4A9E-4C5A-9B3F-8E1D2C3A4B5C — the app
  * scans exclusively for this UUID; anything else is invisible to it. */
@@ -86,6 +157,23 @@ static void drop_conn(uint16_t conn_handle)
         return;
     }
     memset(state, 0, sizeof(*state));
+}
+
+/* Peripheral links carry our packets as notifications; central links (other
+ * Bitles we dialed) carry them as writes to the peer's characteristic. */
+static int link_send(ble_conn_state_t *state, const uint8_t *data, uint16_t len)
+{
+    if (state->is_central) {
+        if (!state->remote_val_handle) {
+            return BLE_HS_EINVAL;
+        }
+        return ble_gattc_write_no_rsp_flat(state->conn_handle, state->remote_val_handle, data, len);
+    }
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
+    if (!om) {
+        return BLE_HS_ENOMEM;
+    }
+    return ble_gattc_notify_custom(state->conn_handle, s_tx_val_handle, om);
 }
 
 static void dispatch_packet(uint16_t conn_handle, const bitchat_packet_t *packet);
@@ -340,14 +428,9 @@ static void relay_packet(uint16_t src_conn, uint8_t *buffer, uint16_t len, const
         if (!state->in_use || !state->subscribed || state->conn_handle == src_conn) {
             continue;
         }
-        struct os_mbuf *om = ble_hs_mbuf_from_flat(buffer, len);
-        if (!om) {
-            ESP_LOGW(TAG, "Relay alloc failed conn=%u", state->conn_handle);
-            break;
-        }
-        int rc = ble_gattc_notify_custom(state->conn_handle, s_tx_val_handle, om);
+        int rc = link_send(state, buffer, len);
         if (rc != 0) {
-            ESP_LOGW(TAG, "Relay notify failed conn=%u rc=%d", state->conn_handle, rc);
+            ESP_LOGW(TAG, "Relay send failed conn=%u rc=%d", state->conn_handle, rc);
         } else {
             forwarded++;
         }
@@ -355,6 +438,19 @@ static void relay_packet(uint16_t src_conn, uint8_t *buffer, uint16_t len, const
     if (forwarded > 0) {
         ESP_LOGI(TAG, "Relayed type=0x%02X ttl=%u to %d conn(s)", packet->type, buffer[2], forwarded);
     }
+}
+
+static bool handle_inbound(uint16_t conn_handle, uint8_t *buffer, uint16_t len)
+{
+    bitchat_packet_t packet;
+    if (!bitchat_packet_decode(buffer, len, &packet)) {
+        ESP_LOGW(TAG, "Failed to decode inbound packet len=%u", len);
+        return false;
+    }
+    dispatch_packet(conn_handle, &packet);
+    relay_packet(conn_handle, buffer, len, &packet);
+    bitchat_packet_free(&packet);
+    return true;
 }
 
 static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
@@ -378,15 +474,9 @@ static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         return BLE_ATT_ERR_UNLIKELY;
     }
 
-    bitchat_packet_t packet;
-    if (!bitchat_packet_decode(buffer, copied, &packet)) {
-        ESP_LOGW(TAG, "Failed to decode inbound packet len=%u", copied);
+    if (!handle_inbound(conn_handle, buffer, copied)) {
         return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     }
-
-    dispatch_packet(conn_handle, &packet);
-    relay_packet(conn_handle, buffer, copied, &packet);
-    bitchat_packet_free(&packet);
     return 0;
 }
 
@@ -410,6 +500,9 @@ static const struct ble_gatt_svc_def s_gatt_svcs[] = {
 
 static void start_advertising(void)
 {
+    if (ble_gap_adv_active()) {
+        return;
+    }
     /* flags(3) + name(13) + uuid128(18) exceeds the 31-byte legacy advertising
      * payload, so the service UUID goes in the advertisement (clients scan by
      * it) and the name in the scan response. */
@@ -451,6 +544,161 @@ static void start_advertising(void)
     }
 }
 
+/* --- Central engine: discover and dial other Bitle nodes ----------------- */
+
+static void central_disc_failed(uint16_t conn_handle, const char *stage, int rc)
+{
+    ESP_LOGW(TAG, "conn=%u central %s failed rc=%d; dropping link", conn_handle, stage, rc);
+    ble_conn_state_t *state = find_conn(conn_handle);
+    if (state) {
+        deny_addr(&state->peer_addr, esp_timer_get_time() / 1000ULL);
+    }
+    ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+}
+
+static int central_cccd_written(uint16_t conn_handle, const struct ble_gatt_error *error,
+                                struct ble_gatt_attr *attr, void *arg)
+{
+    (void)attr;
+    (void)arg;
+    if (error->status != 0) {
+        central_disc_failed(conn_handle, "CCCD write", error->status);
+        return 0;
+    }
+    ble_conn_state_t *state = find_conn(conn_handle);
+    if (!state) {
+        return 0;
+    }
+    state->subscribed = true;
+    ESP_LOGI(TAG, "conn=%u bitle-to-bitle link ready (val_handle=%u)",
+             conn_handle, state->remote_val_handle);
+    noise_notify_subscribed(conn_handle);
+    return 0;
+}
+
+static int central_dsc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                          uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg)
+{
+    (void)chr_val_handle;
+    (void)arg;
+    ble_conn_state_t *state = find_conn(conn_handle);
+    if (!state) {
+        return 0;
+    }
+    if (error->status == 0 && dsc &&
+        ble_uuid_cmp(&dsc->uuid.u, BLE_UUID16_DECLARE(0x2902)) == 0) {
+        uint8_t enable[2] = {0x01, 0x00}; /* notifications */
+        int rc = ble_gattc_write_flat(conn_handle, dsc->handle, enable, sizeof(enable),
+                                      central_cccd_written, NULL);
+        if (rc != 0) {
+            central_disc_failed(conn_handle, "CCCD write start", rc);
+        }
+        return BLE_HS_EDONE; /* stop descriptor discovery */
+    }
+    if (error->status == BLE_HS_EDONE) {
+        return 0;
+    }
+    if (error->status != 0) {
+        central_disc_failed(conn_handle, "descriptor discovery", error->status);
+    }
+    return 0;
+}
+
+static int central_chr_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                          const struct ble_gatt_chr *chr, void *arg)
+{
+    (void)arg;
+    ble_conn_state_t *state = find_conn(conn_handle);
+    if (!state) {
+        return 0;
+    }
+    if (error->status == 0 && chr) {
+        state->remote_val_handle = chr->val_handle;
+        return 0;
+    }
+    if (error->status == BLE_HS_EDONE) {
+        if (!state->remote_val_handle) {
+            central_disc_failed(conn_handle, "characteristic lookup", BLE_HS_ENOENT);
+            return 0;
+        }
+        int rc = ble_gattc_disc_all_dscs(conn_handle, state->remote_val_handle,
+                                         state->svc_end_handle, central_dsc_cb, NULL);
+        if (rc != 0) {
+            central_disc_failed(conn_handle, "descriptor discovery start", rc);
+        }
+        return 0;
+    }
+    central_disc_failed(conn_handle, "characteristic discovery", error->status);
+    return 0;
+}
+
+static int central_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                          const struct ble_gatt_svc *service, void *arg)
+{
+    (void)arg;
+    ble_conn_state_t *state = find_conn(conn_handle);
+    if (!state) {
+        return 0;
+    }
+    if (error->status == 0 && service) {
+        state->svc_end_handle = service->end_handle;
+        int rc = ble_gattc_disc_chrs_by_uuid(conn_handle, service->start_handle,
+                                             service->end_handle, &s_txrx_uuid.u,
+                                             central_chr_cb, NULL);
+        if (rc != 0) {
+            central_disc_failed(conn_handle, "characteristic discovery start", rc);
+        }
+        return BLE_HS_EDONE;
+    }
+    if (error->status == BLE_HS_EDONE) {
+        if (!state->svc_end_handle) {
+            central_disc_failed(conn_handle, "service lookup", BLE_HS_ENOENT);
+        }
+        return 0;
+    }
+    central_disc_failed(conn_handle, "service discovery", error->status);
+    return 0;
+}
+
+static void central_start_discovery(uint16_t conn_handle)
+{
+    ble_gattc_exchange_mtu(conn_handle, NULL, NULL);
+    int rc = ble_gattc_disc_svc_by_uuid(conn_handle, &s_service_uuid.u, central_svc_cb, NULL);
+    if (rc != 0) {
+        central_disc_failed(conn_handle, "service discovery start", rc);
+    }
+}
+
+static void maybe_connect_to_bitle(const struct ble_gap_disc_desc *disc)
+{
+    uint64_t now = esp_timer_get_time() / 1000ULL;
+
+    struct ble_hs_adv_fields fields;
+    if (ble_hs_adv_parse_fields(&fields, disc->data, disc->length_data) != 0) {
+        return;
+    }
+    if (fields.name_len != strlen(BITLE_DEVICE_NAME) ||
+        memcmp(fields.name, BITLE_DEVICE_NAME, fields.name_len) != 0) {
+        return; /* phones and other peripherals: connect to us, not us to them */
+    }
+    if (addr_denied(&disc->addr, now) || already_linked_to(&disc->addr)) {
+        return;
+    }
+    if (count_connections(true) >= BITLE_CENTRAL_MAX_LINKS ||
+        count_connections(false) + BITLE_CENTRAL_RESERVE >= BITLE_BLE_MAX_CONNECTIONS) {
+        return;
+    }
+
+    ble_gap_disc_cancel();
+    ESP_LOGI(TAG, "Found Bitle peer %02x:%02x:%02x:%02x:%02x:%02x; connecting",
+             disc->addr.val[5], disc->addr.val[4], disc->addr.val[3],
+             disc->addr.val[2], disc->addr.val[1], disc->addr.val[0]);
+    int rc = ble_gap_connect(s_own_addr_type, &disc->addr, 10000, NULL, gap_event_cb, NULL);
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+        ESP_LOGW(TAG, "ble_gap_connect failed rc=%d", rc);
+    }
+}
+
 static int gap_event_cb(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
@@ -462,14 +710,25 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             if (!state) {
                 ESP_LOGW(TAG, "No conn slots left for handle=%u", conn);
                 ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
-            } else {
-                state->connected_at_ms = esp_timer_get_time() / 1000ULL;
-                ESP_LOGI(TAG, "Connected conn=%u", conn);
+                return 0;
+            }
+            state->connected_at_ms = esp_timer_get_time() / 1000ULL;
+            struct ble_gap_conn_desc desc;
+            if (ble_gap_conn_find(conn, &desc) == 0) {
+                state->peer_addr = desc.peer_id_addr;
+                state->is_central = (desc.role == BLE_GAP_ROLE_MASTER);
+            }
+            ESP_LOGI(TAG, "Connected conn=%u role=%s", conn,
+                     state->is_central ? "central" : "peripheral");
+            if (state->is_central) {
+                central_start_discovery(conn);
             }
         } else {
             ESP_LOGW(TAG, "Connect failed status=%d", event->connect.status);
-            start_advertising();
         }
+        /* Keep accepting phones (and other Bitles) regardless of how many
+         * links are already up — advertising must survive every connect. */
+        start_advertising();
         return 0;
 
     case BLE_GAP_EVENT_DISCONNECT:
@@ -479,6 +738,26 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         drop_conn(event->disconnect.conn.conn_handle);
         start_advertising();
         return 0;
+
+    case BLE_GAP_EVENT_DISC:
+        maybe_connect_to_bitle(&event->disc);
+        return 0;
+
+    case BLE_GAP_EVENT_DISC_COMPLETE:
+        return 0;
+
+    case BLE_GAP_EVENT_NOTIFY_RX: {
+        uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
+        if (len == 0 || len > BITCHAT_BLE_MAX_PACKET_SIZE) {
+            return 0;
+        }
+        uint8_t buffer[BITCHAT_BLE_MAX_PACKET_SIZE];
+        uint16_t copied = 0;
+        if (ble_hs_mbuf_to_flat(event->notify_rx.om, buffer, sizeof(buffer), &copied) == 0 && copied) {
+            handle_inbound(event->notify_rx.conn_handle, buffer, copied);
+        }
+        return 0;
+    }
 
     case BLE_GAP_EVENT_SUBSCRIBE: {
         ble_conn_state_t *state = find_conn(event->subscribe.conn_handle);
@@ -584,6 +863,34 @@ esp_err_t bitchat_ble_start(void)
 
 #define BITLE_SUBSCRIBE_TIMEOUT_MS 30000ULL
 
+static void maybe_start_scan(uint64_t now)
+{
+    static uint64_t s_last_scan_ms;
+    if (!s_host_synced || now - s_last_scan_ms < BITLE_SCAN_INTERVAL_MS) {
+        return;
+    }
+    if (ble_gap_disc_active() || ble_gap_conn_active()) {
+        return;
+    }
+    if (count_connections(true) >= BITLE_CENTRAL_MAX_LINKS ||
+        count_connections(false) + BITLE_CENTRAL_RESERVE >= BITLE_BLE_MAX_CONNECTIONS) {
+        return;
+    }
+    s_last_scan_ms = now;
+    struct ble_gap_disc_params params = {
+        .itvl = 0x0060,
+        .window = 0x0030,
+        .passive = 0,               /* active: Bitle's name lives in scan_rsp */
+        .filter_duplicates = 1,
+    };
+    int rc = ble_gap_disc(s_own_addr_type, BITLE_SCAN_DURATION_MS, &params, gap_event_cb, NULL);
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+        ESP_LOGW(TAG, "ble_gap_disc failed rc=%d", rc);
+    } else {
+        ESP_LOGD(TAG, "Scanning for Bitle peers");
+    }
+}
+
 void bitchat_ble_poll(void)
 {
     /* Watchdog: a central that connects but never enables notifications
@@ -601,6 +908,25 @@ void bitchat_ble_poll(void)
             ble_gap_terminate(state->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         }
     }
+
+    maybe_start_scan(now);
+}
+
+bool bitchat_ble_conn_is_central(uint16_t conn_handle)
+{
+    ble_conn_state_t *state = find_conn(conn_handle);
+    return state && state->is_central;
+}
+
+void bitchat_ble_disconnect(uint16_t conn_handle)
+{
+    ble_conn_state_t *state = find_conn(conn_handle);
+    if (state) {
+        /* Cool-down so the scanner does not immediately re-dial a peer we
+         * deliberately dropped (duplicate-link resolution). */
+        deny_addr(&state->peer_addr, esp_timer_get_time() / 1000ULL);
+    }
+    ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
 }
 
 bool bitchat_ble_conn_subscribed(uint16_t conn_handle)
@@ -623,14 +949,9 @@ esp_err_t bitchat_ble_send(uint16_t conn_handle, const uint8_t *data, size_t len
         return ESP_ERR_INVALID_STATE;
     }
 
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(data, (uint16_t)len);
-    if (!om) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    int rc = ble_gattc_notify_custom(conn_handle, s_tx_val_handle, om);
+    int rc = link_send(state, data, (uint16_t)len);
     if (rc != 0) {
-        ESP_LOGW(TAG, "notify failed conn=%u rc=%d", conn_handle, rc);
+        ESP_LOGW(TAG, "send failed conn=%u rc=%d", conn_handle, rc);
         return ESP_FAIL;
     }
     return ESP_OK;
@@ -650,12 +971,16 @@ esp_err_t bitchat_ble_send_with_ack(uint16_t conn_handle, const uint8_t *data, s
         return ESP_ERR_INVALID_STATE;
     }
 
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(data, (uint16_t)len);
-    if (!om) {
-        return ESP_ERR_NO_MEM;
+    int rc;
+    if (state->is_central) {
+        rc = ble_gattc_write_no_rsp_flat(conn_handle, state->remote_val_handle, data, (uint16_t)len);
+    } else {
+        struct os_mbuf *om = ble_hs_mbuf_from_flat(data, (uint16_t)len);
+        if (!om) {
+            return ESP_ERR_NO_MEM;
+        }
+        rc = ble_gatts_indicate_custom(conn_handle, s_tx_val_handle, om);
     }
-
-    int rc = ble_gatts_indicate_custom(conn_handle, s_tx_val_handle, om);
     if (rc != 0) {
         ESP_LOGW(TAG, "indicate failed conn=%u rc=%d", conn_handle, rc);
         return ESP_FAIL;

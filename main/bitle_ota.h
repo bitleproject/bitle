@@ -12,7 +12,7 @@ extern "C" {
 
 /* Monotonic firmware version. Bump on every release and pass the same
  * number to tools/sign_fw.py --version. Nodes only accept higher versions. */
-#define BITLE_FW_VERSION 2
+#define BITLE_FW_VERSION 3
 
 esp_err_t bitle_ota_init(void);
 

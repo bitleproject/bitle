@@ -60,16 +60,31 @@ or laptop script that speaks the four `0xA0`–`0xA3` OTA packet types). That
 node verifies, applies, reboots into the new image, and begins advertising
 the new version.
 
-**Propagation (the mesh does the rest):** each node advertises its firmware
-version in a private announce TLV (`0xB0`). A node running a newer image
-that hears a stale neighbour offers its signed manifest; the stale node
-requests chunks and pulls the image over the mesh — directly or *through a
-phone bridge*, since the OTA packet types relay like any other. One seeded
-node epidemically updates every node it can eventually reach.
+**Propagation (the mesh does the rest):** Bitle nodes discover and connect
+to each other directly over BLE (they run as BLE central *and* peripheral,
+so a node keeps accepting phones while dialing peer nodes — two outbound
+peer links max, with slots always reserved for phones). Each node advertises
+its firmware version in a private announce TLV (`0xB0`). A node running a
+newer image that hears a stale neighbour offers its signed manifest; the
+stale node requests chunks and pulls the image node-to-node. A node that
+finishes updating stores the manifest and immediately becomes a server
+itself, so one seeded node epidemically updates every node it can reach —
+no phone required.
 
-To let a **wire-flashed** node serve its own running image to peers (rather
-than only receive), send it the matching `.bota` manifest once; it confirms
-the manifest's hash against its running image and starts serving.
+> Phones do **not** carry OTA traffic: BitChat drops unknown packet types
+> rather than relaying them, so propagation rides Bitle's own node-to-node
+> links, not phone bridges.
+
+To let a **wire-flashed** node serve its own running image to peers, flash
+the matching manifest into its `fw_manifest` partition:
+
+```bash
+python tools/seed_manifest.py <port> build/bitle.bin.bota   # then reset
+```
+
+On boot the node verifies the manifest against its own flash and starts
+serving. A node that received its image over the air already has the
+manifest and serves with no extra step.
 
 ## Wire protocol (packet types)
 
