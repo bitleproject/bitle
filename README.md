@@ -6,7 +6,7 @@ Bitle is a self-powered ESP32-C3 BitChat relay node. It extends BitChat’s Blue
 
 - **Full BitChat handshake** – Implements the Noise XX pattern with the upstream `noise_ref` library, performing Ed25519 identity binding like the mobile apps.
 - **BLE mesh relay** – Runs a NimBLE GATT service that BitChat clients subscribe to; packets are encoded/decoded with the BitChat binary format and forwarded transparently.
-- **Time sync & nicknames** – Maintains a BLE-derived epoch for packet timestamps and advertises deterministic `anon####` nicknames (configurable through NVS).
+- **Time sync & nicknames** – Maintains a BLE-derived epoch for packet timestamps and advertises deterministic `Bitle-####` nicknames (configurable through NVS).
 - **Ready for solar/battery deployments** – Firmware is autonomous; once flashed it will advertise, accept connections, and keep the mesh alive indefinitely.
 
 ## Repository layout
@@ -45,6 +45,20 @@ idf.py -p /dev/cu.usbmodem101 flash monitor
 ```
 
 Adjust the serial port (`-p`) for your setup. `sdkconfig` will be generated from `sdkconfig.defaults` during the first build.
+
+## Firmware updates & owner key
+
+Bitle supports signed, mesh-propagating over-the-air (OTA) updates, so nodes already deployed in the field can be upgraded without physical access. The full design — dual-slot A/B rollback, Ed25519-signed manifests, and node-to-node propagation — is documented in [docs/OTA.md](docs/OTA.md).
+
+Trust is anchored by a single **owner key**. Each node ships trusting one Ed25519 public key, baked into `main/ota_owner_pubkey.h`; only the holder of the matching private key can sign an image the fleet will accept. That private key lives outside the repo (by default `~/bitle-keys/bitle_owner_key.hex`) and is never committed.
+
+> **Running your own independent fleet?** The public key committed here belongs to the Bitle project, so nodes you flash from this repo unmodified will trust *official* Bitle firmware releases. If you are deploying a fleet you alone control, generate your own key pair first and rebuild:
+>
+> ```bash
+> python tools/gen_owner_key.py   # writes ~/bitle-keys/bitle_owner_key.hex (private) and regenerates main/ota_owner_pubkey.h (public)
+> ```
+>
+> Keep the private key offline and backed up: **losing it** means you can never OTA-update your deployed nodes again, and **leaking it** lets an attacker sign firmware for every node that trusts it.
 
 ## License
 
