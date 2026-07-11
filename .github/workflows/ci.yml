@@ -9,7 +9,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container:
-      image: espressif/idf:latest
+      # Pinned to the ESP-IDF version the firmware is developed and tested on.
+      # `latest` drifts ahead (v6.1+) and fails on stricter warnings-as-errors
+      # and mbedTLS API changes that v6.0 does not have.
+      image: espressif/idf:release-v6.0
     steps:
       - name: Checkout
         uses: actions/checkout@v4
