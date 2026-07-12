@@ -8,6 +8,7 @@
 #include "bitchat_ble.h"
 #include "bitchat_time.h"
 #include "bitle_courier.h"
+#include "bitle_hash.h"
 #include "bitle_ota.h"
 #include "bitle_sync.h"
 #include "noise_handshake.h"
@@ -48,6 +49,10 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     ESP_LOGI(TAG, "Starting Bitle firmware");
+
+    /* Everything below hashes (peer ids, courier tags, sync ids, OTA
+     * digests) — bring PSA up and prove it first. */
+    ESP_ERROR_CHECK(bitle_hash_init());
 
     ESP_ERROR_CHECK(bitchat_time_init());
     ESP_ERROR_CHECK(bitchat_noise_init());

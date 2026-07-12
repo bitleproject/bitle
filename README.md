@@ -32,7 +32,7 @@ A single node runs a genuinely simultaneous **dual-role BLE stack** on NimBLE. I
 
 ## Boot sequence
 
-`app_main()` runs a fixed init order: NVS → time → Noise → OTA → sync → courier → packet codec (with self-test) → BLE init → BLE start, then spawns a single `bitle_main` FreeRTOS task that polls BLE, Noise, and the clock every 50 ms. Most init steps are fatal on failure (`ESP_ERROR_CHECK` / `abort`); the courier mailbox is the one optional subsystem — if it can't start, the node logs a warning and continues without store-and-forward. If NVS reports a layout/version change, the flash is erased and re-initialized rather than bricking boot.
+`app_main()` runs a fixed init order: NVS → PSA crypto (with SHA-256/HMAC known-answer self-tests) → time → Noise → OTA → sync → courier → packet codec (with self-test) → BLE init → BLE start, then spawns a single `bitle_main` FreeRTOS task that polls BLE, Noise, and the clock every 50 ms. Most init steps are fatal on failure (`ESP_ERROR_CHECK` / `abort`); the courier mailbox is the one optional subsystem — if it can't start, the node logs a warning and continues without store-and-forward. If NVS reports a layout/version change, the flash is erased and re-initialized rather than bricking boot.
 
 ## Repository layout
 
@@ -55,6 +55,7 @@ A single node runs a genuinely simultaneous **dual-role BLE stack** on NimBLE. I
     ├── bitchat_ble.{c,h}       # dual-role BLE (peripheral + central), relay, fragments
     ├── noise_handshake.{c,h}   # Noise XX, announce TLVs, message dispatch
     ├── packet_codec.{c,h}      # BitChat binary packet encode/decode
+    ├── bitle_hash.{c,h}        # SHA-256/HMAC via PSA (mbedTLS 3.x & 4.x compatible)
     ├── bitle_ota.{c,h}         # dual-slot OTA, signed manifests
     ├── ota_owner_pubkey.h      # baked-in owner public key (generated)
     ├── bitle_courier.{c,h}     # store-and-forward courier mailbox
@@ -82,7 +83,7 @@ Because OTA relies on this dual-slot layout, **nodes must be wire-flashed with t
 
 ## Building & flashing
 
-The firmware is developed and tested with **ESP-IDF v6.0** and targets **`esp32c3` only**. (The component manifest nominally floors at IDF `>=4.1.0`, but v6.0 / esp32c3 is what is actually built and tested.)
+The firmware is developed and tested with **ESP-IDF v6.0** and targets **`esp32c3` only**. All hashing goes through the PSA Crypto API, so it builds against both mbedTLS 3.x (v6.0 pre-release snapshots) and mbedTLS 4.x (v6.0 release line, which removed the legacy `mbedtls/sha256.h` API). The component manifest floors at IDF `>=5.0`, but v6.0 / esp32c3 is what is actually built and tested.
 
 ### Prerequisites
 

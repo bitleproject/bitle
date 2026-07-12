@@ -1,6 +1,6 @@
 ## IDF Component Manager Manifest File
 dependencies:
   idf:
-    version: ">=4.1.0"
+    version: ">=5.0"
   bitchat_utils:
     path: ../components/bitchat_utils

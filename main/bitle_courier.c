@@ -3,8 +3,7 @@
 #include <string.h>
 
 #include "esp_log.h"
-#include "mbedtls/md.h"
-#include "mbedtls/sha256.h"
+#include "bitle_hash.h"
 
 #include "bitle_store.h"
 #include "noise_handshake.h"
@@ -153,8 +152,7 @@ static void tag_for_day(const uint8_t noise_key[32], uint32_t epoch_day, uint8_t
     msg[sizeof(TAG_CONTEXT) + 1] = (epoch_day >> 8) & 0xFF;
     msg[sizeof(TAG_CONTEXT) + 2] = epoch_day & 0xFF;
     uint8_t mac[32];
-    mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-                    noise_key, 32, msg, sizeof(msg), mac);
+    bitle_hmac_sha256(noise_key, 32, msg, sizeof(msg), mac);
     memcpy(out, mac, TAG_LEN);
 }
 
@@ -171,7 +169,7 @@ static void candidate_tags(const uint8_t noise_key[32], uint64_t now_ms,
 static void envelope_key(const envelope_t *env, uint8_t out[BITLE_STORE_KEY_LEN])
 {
     uint8_t digest[32];
-    mbedtls_sha256(env->ciphertext, env->ciphertext_len, digest, 0);
+    bitle_sha256(env->ciphertext, env->ciphertext_len, digest);
     memcpy(out, digest, BITLE_STORE_KEY_LEN);
 }
 

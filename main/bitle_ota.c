@@ -10,7 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
-#include "mbedtls/sha256.h"
+#include "bitle_hash.h"
 #include "nvs.h"
 
 #include "ed25519.h"
@@ -64,7 +64,7 @@ static struct {
     uint8_t peer[8];
     uint64_t last_activity_ms;
     uint32_t retries;
-    mbedtls_sha256_context sha;
+    bitle_sha256_ctx_t sha;
 } s_rx;
 
 static ota_manifest_t s_serve_manifest;
@@ -127,21 +127,19 @@ static bool hash_matches_running_image(const ota_manifest_t *manifest)
     if (!running || manifest->size > running->size) {
         return false;
     }
-    mbedtls_sha256_context ctx;
-    mbedtls_sha256_init(&ctx);
-    mbedtls_sha256_starts(&ctx, 0);
+    bitle_sha256_ctx_t ctx;
+    bitle_sha256_begin(&ctx);
     uint8_t buf[1024];
     for (uint32_t off = 0; off < manifest->size; off += sizeof(buf)) {
         size_t n = manifest->size - off < sizeof(buf) ? manifest->size - off : sizeof(buf);
         if (esp_partition_read(running, off, buf, n) != ESP_OK) {
-            mbedtls_sha256_free(&ctx);
+            bitle_sha256_abort(&ctx);
             return false;
         }
-        mbedtls_sha256_update(&ctx, buf, n);
+        bitle_sha256_update(&ctx, buf, n);
     }
     uint8_t digest[32];
-    mbedtls_sha256_finish(&ctx, digest);
-    mbedtls_sha256_free(&ctx);
+    bitle_sha256_finish(&ctx, digest);
     return memcmp(digest, manifest->sha256, sizeof(digest)) == 0;
 }
 
@@ -172,7 +170,7 @@ static void abort_receive(const char *reason)
     ESP_LOGW(TAG, "OTA receive aborted: %s (chunk %lu/%lu)", reason,
              (unsigned long)s_rx.next_chunk, (unsigned long)s_rx.total_chunks);
     esp_ota_abort(s_rx.handle);
-    mbedtls_sha256_free(&s_rx.sha);
+    bitle_sha256_abort(&s_rx.sha);
     memset(&s_rx, 0, sizeof(s_rx));
 }
 
@@ -222,8 +220,7 @@ static void handle_manifest(const ota_event_t *evt)
     s_rx.total_chunks = (manifest.size + manifest.chunk_size - 1) / manifest.chunk_size;
     s_rx.retries = 0;
     s_rx.last_activity_ms = uptime_ms();
-    mbedtls_sha256_init(&s_rx.sha);
-    mbedtls_sha256_starts(&s_rx.sha, 0);
+    bitle_sha256_begin(&s_rx.sha);
     ESP_LOGI(TAG, "OTA v%lu started: %lu bytes in %lu chunks of %u",
              (unsigned long)manifest.version, (unsigned long)manifest.size,
              (unsigned long)s_rx.total_chunks, manifest.chunk_size);
@@ -233,8 +230,7 @@ static void handle_manifest(const ota_event_t *evt)
 static void finish_receive(void)
 {
     uint8_t digest[32];
-    mbedtls_sha256_finish(&s_rx.sha, digest);
-    mbedtls_sha256_free(&s_rx.sha);
+    bitle_sha256_finish(&s_rx.sha, digest);
     if (memcmp(digest, s_rx.manifest.sha256, sizeof(digest)) != 0) {
         ESP_LOGE(TAG, "Image hash mismatch after transfer");
         esp_ota_abort(s_rx.handle);
@@ -285,7 +281,7 @@ static void handle_chunk(const ota_event_t *evt)
         abort_receive("flash write failed");
         return;
     }
-    mbedtls_sha256_update(&s_rx.sha, data, data_len);
+    bitle_sha256_update(&s_rx.sha, data, data_len);
     s_rx.next_chunk++;
     s_rx.retries = 0;
     if ((s_rx.next_chunk & 0x3F) == 0) {

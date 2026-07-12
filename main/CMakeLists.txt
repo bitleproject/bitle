@@ -4,6 +4,7 @@ idf_component_register(SRCS
     "noise_handshake.c"
     "packet_codec.c"
     "nickname_manager.c"
+    "bitle_hash.c"
     "bitle_ota.c"
     "bitle_store.c"
     "bitle_courier.c"

@@ -5,7 +5,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
-#include "mbedtls/sha256.h"
+#include "bitle_hash.h"
 
 #include "bitchat_ble.h"
 #include "bitchat_time.h"
@@ -81,23 +81,21 @@ static peer_state_t *peer_state(uint16_t conn_handle)
 
 static void packet_id(const bitchat_packet_t *packet, uint8_t out[16])
 {
-    mbedtls_sha256_context ctx;
-    mbedtls_sha256_init(&ctx);
-    mbedtls_sha256_starts(&ctx, 0);
+    bitle_sha256_ctx_t ctx;
+    bitle_sha256_begin(&ctx);
     uint8_t type = packet->type;
-    mbedtls_sha256_update(&ctx, &type, 1);
-    mbedtls_sha256_update(&ctx, packet->sender_id, 8);
+    bitle_sha256_update(&ctx, &type, 1);
+    bitle_sha256_update(&ctx, packet->sender_id, 8);
     uint8_t ts[8];
     for (int i = 0; i < 8; ++i) {
         ts[i] = (packet->timestamp_ms >> ((7 - i) * 8)) & 0xFF;
     }
-    mbedtls_sha256_update(&ctx, ts, 8);
+    bitle_sha256_update(&ctx, ts, 8);
     if (packet->payload_len) {
-        mbedtls_sha256_update(&ctx, packet->payload, packet->payload_len);
+        bitle_sha256_update(&ctx, packet->payload, packet->payload_len);
     }
     uint8_t digest[32];
-    mbedtls_sha256_finish(&ctx, digest);
-    mbedtls_sha256_free(&ctx);
+    bitle_sha256_finish(&ctx, digest);
     memcpy(out, digest, 16);
 }
 
@@ -107,7 +105,7 @@ static uint64_t gcs_bucket(const uint8_t id[16], uint32_t m)
         return 0;
     }
     uint8_t digest[32];
-    mbedtls_sha256(id, 16, digest, 0);
+    bitle_sha256(id, 16, digest);
     uint64_t h = 0;
     for (int i = 0; i < 8; ++i) {
         h = (h << 8) | digest[i];
@@ -333,7 +331,7 @@ static bool derive_owner(const bitchat_packet_t *packet, uint8_t owner[8])
             }
             if (t == 0x01 && l == 32) {
                 uint8_t digest[32];
-                mbedtls_sha256(p + off, 32, digest, 0);
+                bitle_sha256(p + off, 32, digest);
                 memcpy(owner, digest, 8);
                 return true;
             }
