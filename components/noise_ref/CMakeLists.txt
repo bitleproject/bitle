@@ -39,3 +39,12 @@ set_source_files_properties(
     PROPERTIES
         COMPILE_FLAGS "-DED25519_CUSTOMRANDOM -DED25519_CUSTOMHASH"
 )
+
+# Vendored Noise-C reference crypto, kept unmodified. Newer GCC (15.x, used
+# by recent ESP-IDF CI images) treats intentional switch fall-through in the
+# donna ed25519 math and portable-in-practice `defined()` macros in
+# poly1305 as errors when a general -Werror is in effect. These are false
+# positives in third-party code we do not maintain, so demote warnings to
+# non-fatal for this component only. Our own components keep -Werror.
+# (Appended after IDF's global flags, so -Wno-error wins.)
+target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error)
