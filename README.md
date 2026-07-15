@@ -81,6 +81,11 @@ The build seeds a **4 MB** flash with a custom partition table (`partitions.csv`
 
 Because OTA relies on this dual-slot layout, **nodes must be wire-flashed with this partition table before their enclosures are sealed** — the A/B capability cannot be retrofitted remotely.
 
+## Hardware
+
+- **Bitle node (reference)** — Seeed Studio XIAO ESP32C3 with a 2.4 GHz antenna, solar charger, battery, and panel; the full parts list is at [bitle.org](https://bitle.org).
+- **Bitle-LR node (LoRa platform)** — the [Seeed Studio XIAO ESP32S3 & Wio-SX1262 kit](https://www.seeedstudio.com/Wio-SX1262-with-XIAO-ESP32S3-p-5982.html), also sold [with a 3D case, SMA antenna, and cable](https://www.seeedstudio.com/XIAO-ESP32S3-for-Meshtastic-LoRa-with-3D-Printed-Enclosure-p-6314.html). It ships pre-flashed with Meshtastic — run `idf.py erase-flash` before flashing Bitle. Today it runs the standard firmware as a full BLE relay node; the SX1262 long-range LoRa trunk between nodes is in active development. Power parts (charger, battery, panel) are shared with the reference build.
+
 ## Building & flashing
 
 The firmware is developed and tested with **ESP-IDF v6.0** and supports the **`esp32c3`** and **`esp32s3`** targets — both validated on hardware (Seeed XIAO ESP32C3 and XIAO ESP32S3). All hashing goes through the PSA Crypto API, so it builds against both mbedTLS 3.x (v6.0 pre-release snapshots) and mbedTLS 4.x (v6.0 release line, which removed the legacy `mbedtls/sha256.h` API). The component manifest floors at IDF `>=5.0`, but v6.0 is what is actually built and tested.
