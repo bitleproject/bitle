@@ -8,6 +8,11 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Both supported node targets: XIAO ESP32C3 (reference) and
+        # XIAO ESP32S3 (LoRa backhaul platform).
+        target: [esp32c3, esp32s3]
     container:
       # Pinned to the ESP-IDF version the firmware is developed and tested on.
       # `latest` drifts ahead (v6.1+) and fails on stricter warnings-as-errors
@@ -17,9 +22,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build ESP32-C3 firmware
+      - name: Build ${{ matrix.target }} firmware
         shell: bash
         run: |
           . /opt/esp/idf/export.sh
-          idf.py set-target esp32c3
+          idf.py set-target ${{ matrix.target }}
           idf.py build

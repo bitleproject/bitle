@@ -2,7 +2,7 @@
 
 Bitle is an autonomous ESP32-C3 BitChat mesh relay node. Once flashed, it needs no phone and no user interaction: it advertises over BLE, completes Noise XX handshakes, validates and re-broadcasts BitChat packets, carries store-and-forward courier mail for offline recipients, gossip-syncs recent public traffic with peers, and self-propagates signed firmware updates node-to-node. It is well suited to extending a BitChat mesh in places like remote trails, campsites, or any offline comms grid, and is designed for solar/battery deployments where the enclosure is sealed and never touched again.
 
-The reference hardware pairs an ESP32-C3 with a flexible 2.4 GHz antenna, a weatherproof enclosure, solar input, and a battery pack. The firmware builds only for the `esp32c3` target and is developed and tested on ESP-IDF v6.0.
+The reference hardware pairs an ESP32-C3 with a flexible 2.4 GHz antenna, a weatherproof enclosure, solar input, and a battery pack. The firmware is developed and tested on ESP-IDF v6.0 and runs unmodified on both the `esp32c3` and `esp32s3` targets — the same source powers XIAO ESP32C3 nodes and the XIAO ESP32S3 (the platform for upcoming LoRa backhaul work).
 
 ## What it does
 
@@ -83,7 +83,7 @@ Because OTA relies on this dual-slot layout, **nodes must be wire-flashed with t
 
 ## Building & flashing
 
-The firmware is developed and tested with **ESP-IDF v6.0** and targets **`esp32c3` only**. All hashing goes through the PSA Crypto API, so it builds against both mbedTLS 3.x (v6.0 pre-release snapshots) and mbedTLS 4.x (v6.0 release line, which removed the legacy `mbedtls/sha256.h` API). The component manifest floors at IDF `>=5.0`, but v6.0 / esp32c3 is what is actually built and tested.
+The firmware is developed and tested with **ESP-IDF v6.0** and supports the **`esp32c3`** and **`esp32s3`** targets — both validated on hardware (Seeed XIAO ESP32C3 and XIAO ESP32S3). All hashing goes through the PSA Crypto API, so it builds against both mbedTLS 3.x (v6.0 pre-release snapshots) and mbedTLS 4.x (v6.0 release line, which removed the legacy `mbedtls/sha256.h` API). The component manifest floors at IDF `>=5.0`, but v6.0 is what is actually built and tested.
 
 ### Prerequisites
 
@@ -97,7 +97,7 @@ source ~/esp-idf/export.sh
 ### Build
 
 ```bash
-idf.py set-target esp32c3
+idf.py set-target esp32c3   # or esp32s3
 idf.py build
 idf.py -p /dev/cu.usbmodem101 flash monitor
 ```
