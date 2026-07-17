@@ -6,7 +6,7 @@ retrieving hardware. This document covers the trust model, the one-time
 setup, and how to cut and distribute a release.
 
 > **Deploy the OTA-capable image before sealing enclosures.** OTA cannot be
-> retrofitted remotely: a node still running the original single-`factory`
+> retrofitted remotely: a node flashed with a single-`factory` partition
 > layout has nowhere to stage an update. Flash the dual-slot image
 > (this firmware) by wire first; after that, everything is remote.
 
@@ -46,7 +46,7 @@ images you deploy.
 
    ```bash
    idf.py build
-   python tools/sign_fw.py build/bitle.bin --version 3
+   python tools/sign_fw.py build/bitle.bin --version <N>   # match BITLE_FW_VERSION
    ```
 
    This writes `build/bitle.bin.bota`, a 110-byte signed manifest that
@@ -65,7 +65,7 @@ to each other directly over BLE (they run as BLE central *and* peripheral,
 so a node keeps accepting phones while dialing peer nodes — two outbound
 peer links max, with slots always reserved for phones). Each node advertises
 its firmware version in a private announce TLV (`0xB0`). A node running a
-newer image that hears a stale neighbour offers its signed manifest; the
+newer image that hears a stale neighbor offers its signed manifest; the
 stale node requests chunks and pulls the image node-to-node. A node that
 finishes updating stores the manifest and immediately becomes a server
 itself, so one seeded node epidemically updates every node it can reach —
@@ -99,5 +99,6 @@ Manifest layout: `"BOTA" version(4) size(4) sha256(32) chunk(2) sig(64)`,
 all integers big-endian; the signature covers
 `"bitle-fw-v1" || version || size || sha256 || chunk`.
 
-Transfers are stop-and-wait with receiver-driven requests and a resume-on-
-timeout retry, so a dropped BLE link resumes rather than restarting.
+Transfers are stop-and-wait with receiver-driven requests and a
+resume-on-timeout retry, so a dropped BLE link resumes rather than
+restarting.
