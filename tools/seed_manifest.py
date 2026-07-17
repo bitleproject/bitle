@@ -37,7 +37,7 @@ def main() -> int:
         tmp_path = tmp.name
     try:
         cmd = [
-            sys.executable, "-m", "esptool", "--chip", "esp32c3", "-p", port,
+            sys.executable, "-m", "esptool", "--chip", "auto", "-p", port,
             "write_flash", hex(MANIFEST_OFFSET), tmp_path,
         ]
         print("+", " ".join(cmd))

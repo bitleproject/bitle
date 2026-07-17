@@ -35,9 +35,6 @@ __pycache__/
 *.log
 
 # OTA: signed manifests are release artifacts; the owner private key must
-# never be committed (it lives outside the repo under ~/bitle-keys).
+# never be committed (it lives outside the repo).
 *.bota
 *bitle_owner_key*
-
-
-.claude/

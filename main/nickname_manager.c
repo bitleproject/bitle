@@ -151,7 +151,7 @@ esp_err_t nickname_init(char *out_nickname, size_t max_len)
             ESP_LOGW(TAG, "Nickname in NVS not printable, regenerating");
         }
     } else if (err != ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGW(TAG, "Invalid nickname in NVS or read error, regenerating");
+        ESP_LOGW(TAG, "Nickname read from NVS failed (%s), regenerating", esp_err_to_name(err));
     }
 
     nickname_generate(out_nickname, max_len);

@@ -139,11 +139,6 @@ bool bitchat_time_is_valid(void)
     return s_time_valid;
 }
 
-bool bitchat_time_is_peer_synced(void)
-{
-    return s_peer_synced;
-}
-
 uint32_t bitchat_time_sync_generation(void)
 {
     return s_sync_generation;
@@ -289,25 +284,6 @@ void bitchat_time_consider_peer_announce(uint64_t peer_timestamp_ms,
     } else if (upgraded) {
         ESP_LOGI(TAG, "Clock now authoritative (phone-traced)");
     }
-}
-
-void bitchat_time_set_from_wall(uint64_t unix_ms)
-{
-    if (unix_ms == 0 || unix_ms / 1000ULL < MIN_VALID_EPOCH_SECONDS) {
-        return;
-    }
-    taskENTER_CRITICAL(&s_time_lock);
-    uint64_t now_monotonic = monotonic_ms();
-    s_epoch_base_ms = unix_ms - now_monotonic;
-    s_time_valid = true;
-    s_peer_synced = true;
-    s_sync_generation++;
-    s_anchor_wall_ms = unix_ms;      /* trusted source re-anchors the clock */
-    s_anchor_mono_ms = now_monotonic;
-    s_time_authoritative = true;
-    taskEXIT_CRITICAL(&s_time_lock);
-    persist_wall_estimate(unix_ms);
-    ESP_LOGI(TAG, "Epoch base forced to %llu", (unsigned long long)(unix_ms - now_monotonic));
 }
 
 void bitchat_time_poll(void)

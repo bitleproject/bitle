@@ -35,7 +35,8 @@ typedef bool (*bitle_store_iter_cb)(const uint8_t key[BITLE_STORE_KEY_LEN],
 esp_err_t bitle_store_init(void);
 
 /* Inserts (or refreshes) a record. Duplicate keys are tombstoned first.
- * Returns ESP_ERR_NO_MEM only if the payload can never fit. */
+ * Returns ESP_ERR_INVALID_ARG for an oversize payload and ESP_ERR_NO_MEM
+ * when no sector can be reclaimed to make room. */
 esp_err_t bitle_store_put(const uint8_t key[BITLE_STORE_KEY_LEN],
                           uint32_t expiry_unix_s, uint8_t flags,
                           const uint8_t *payload, uint16_t payload_len);

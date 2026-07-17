@@ -9,6 +9,9 @@
 #include "bitchat_time.h"
 #include "bitle_courier.h"
 #include "bitle_hash.h"
+#include "bitle_link.h"
+#include "bitle_lora.h"
+#include "bitle_mesh.h"
 #include "bitle_ota.h"
 #include "bitle_sync.h"
 #include "noise_handshake.h"
@@ -24,7 +27,9 @@ static void bitle_main_task(void *arg)
 
     uint64_t last_heap_log_ms = 0;
     while (true) {
+#ifndef BITLE_TEST_NO_BLE
         bitchat_ble_poll();
+#endif
         noise_poll();
         bitchat_time_poll();
 
@@ -61,14 +66,25 @@ void app_main(void)
     if (bitle_courier_init() != ESP_OK) {
         ESP_LOGW(TAG, "Courier mailbox unavailable; continuing without it");
     }
-    packet_codec_init();
     if (!packet_codec_self_test()) {
         ESP_LOGE(TAG, "Packet codec self-test failed");
         abort();
     }
 
+    ESP_ERROR_CHECK(bitle_link_init());
+    ESP_ERROR_CHECK(bitle_mesh_init());
+    /* Radio-optional: probes for an SX1262 and brings the LoRa trunk up
+     * when present; C3 nodes and bare S3s continue BLE-only. */
+    ESP_ERROR_CHECK(bitle_lora_init());
+#ifdef BITLE_TEST_NO_BLE
+    /* Diagnostic build option: compile with -DBITLE_TEST_NO_BLE to disable the
+     * BLE radio so the node is reachable only over the LoRa trunk. Used to
+     * exercise the trunk path in isolation; never enabled in release builds. */
+    ESP_LOGW(TAG, "BLE disabled (BITLE_TEST_NO_BLE): LoRa-only node");
+#else
     ESP_ERROR_CHECK(bitchat_ble_init());
     ESP_ERROR_CHECK(bitchat_ble_start());
+#endif
 
     xTaskCreate(bitle_main_task, "bitle_main", 8192, NULL, tskIDLE_PRIORITY + 5, NULL);
 }

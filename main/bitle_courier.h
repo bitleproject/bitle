@@ -39,8 +39,6 @@ void bitle_courier_peer_announced(uint16_t conn_handle, const uint8_t peer_id[8]
                                   const uint8_t noise_key[32], bool verified,
                                   bool is_direct, uint64_t now_ms);
 
-size_t bitle_courier_count(void);
-
 #ifdef __cplusplus
 }
 #endif

@@ -32,8 +32,9 @@ typedef enum {
     BITCHAT_MSG_REQUEST_SYNC = 0x21,
     BITCHAT_MSG_PREKEY_BUNDLE = 0x24,
     BITCHAT_MSG_GROUP_MESSAGE = 0x25,
-    /* Bitle-private OTA types, outside the upstream range. Phones ignore
-     * them locally but relay them, so updates can cross phone bridges. */
+    /* Bitle-private OTA types, outside the upstream range. Phones drop
+     * unknown types rather than relay them, so OTA traffic moves only on
+     * direct node-to-node links (see docs/OTA.md). */
     BITLE_MSG_OTA_MANIFEST = 0xA0,
     BITLE_MSG_OTA_REQ = 0xA1,
     BITLE_MSG_OTA_CHUNK = 0xA2,
@@ -87,9 +88,7 @@ void noise_handle_encrypted(uint16_t conn_handle, const bitchat_packet_t *packet
 void noise_reset_connection(uint16_t conn_handle);
 void noise_notify_subscribed(uint16_t conn_handle);
 const uint8_t *noise_get_local_peer_id(void);
-const uint8_t *noise_get_static_public_key(void);
 void noise_begin_handshake(uint16_t conn_handle, const uint8_t peer_id[8], const char *nickname);
-bool noise_can_begin_handshake(uint16_t conn_handle);
 bool noise_send_encrypted(uint16_t conn_handle, bitchat_noise_payload_type_t payload_type, const uint8_t *payload, size_t payload_len);
 /* Sends an unsigned, unencrypted packet of the given type (used for the
  * Bitle OTA types; image integrity comes from the signed manifest). */
@@ -97,6 +96,10 @@ esp_err_t noise_send_raw(uint16_t conn_handle, bitchat_message_type_t type, cons
 /* Full-control send: explicit TTL and optional Ed25519 packet signature.
  * requestSync (ttl 0, signed) and courier handovers (ttl 7, signed) use it. */
 esp_err_t noise_send_packet(uint16_t conn_handle, bitchat_message_type_t type, const uint8_t recipient[8], const uint8_t *payload, size_t payload_len, uint8_t ttl, bool sign);
+
+/* Sends our signed identity announce on an arbitrary registered link
+ * (used by the LoRa trunk for neighbor beacons). */
+bool noise_announce_link(uint16_t link_handle);
 
 /* Identity of the direct peer on a connection, learned from its announce.
  * Returns false until a direct announce has been parsed. *verified reflects

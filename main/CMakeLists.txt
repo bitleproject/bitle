@@ -1,17 +1,22 @@
-idf_component_register(SRCS
-    "main.c"
-    "bitchat_ble.c"
-    "noise_handshake.c"
-    "packet_codec.c"
-    "nickname_manager.c"
-    "bitle_hash.c"
-    "bitle_ota.c"
-    "bitle_store.c"
-    "bitle_courier.c"
-    "bitle_sync.c"
-INCLUDE_DIRS "."
-REQUIRES bt nvs_flash noise_ref mbedtls bitchat_utils app_update esp_partition
-    )
+idf_component_register(
+    SRCS
+        "main.c"
+        "bitchat_ble.c"
+        "noise_handshake.c"
+        "packet_codec.c"
+        "nickname_manager.c"
+        "bitle_hash.c"
+        "bitle_link.c"
+        "bitle_mesh.c"
+        "bitle_lora.c"
+        "sx1262.c"
+        "bitle_ota.c"
+        "bitle_store.c"
+        "bitle_courier.c"
+        "bitle_sync.c"
+    INCLUDE_DIRS "."
+    REQUIRES bt nvs_flash noise_ref mbedtls bitchat_utils app_update esp_partition esp_driver_gpio esp_driver_spi
+)
 
 target_include_directories(${COMPONENT_LIB} PRIVATE
     $ENV{IDF_PATH}/components/bt/host/nimble/nimble/nimble/include

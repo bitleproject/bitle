@@ -30,6 +30,7 @@
 #include "noise/protocol/buffer.h"
 #include "noise/protocol/errors.h"
 #include "bitle_hash.h"
+#include "bitle_link.h"
 #include "ed25519.h"
 
 #define NOISE_STATIC_KEY_NS       "noise"
@@ -37,10 +38,8 @@
 #define NOISE_PEER_ID_KEY         "peer_id"
 #define NOISE_SIGN_PUB_KEY        "sign_pk"
 #define NOISE_SIGN_PRIV_KEY       "sign_sk"
-#define NOISE_NICKNAME_KEY        "nickname"
 
 #define NOISE_PROTOCOL_NAME       "Noise_XX_25519_ChaChaPoly_SHA256"
-#define NOISE_PROLOGUE            ""
 
 #define NOISE_MAX_SESSIONS        CONFIG_BT_NIMBLE_MAX_CONNECTIONS
 #define NOISE_QUEUE_DEPTH         12
@@ -51,9 +50,9 @@
 #define ANNOUNCE_INTERVAL_MS      (10 * 1000ULL)
 
 #define BITLE_AUTO_REPLY_TEXT \
-    "This is an automated response: Bitle is a relay node designed to " \
-    "expand the reach of bluetooth mesh networks. It relays encrypted " \
-    "packets while maintaining e2e encryption. bitle.org."
+    "This is an automated reply. Bitle is a relay node that extends the " \
+    "range of Bluetooth mesh networks. It relays encrypted packets " \
+    "without decrypting them, preserving end-to-end encryption. bitle.org"
 
 static const char *TAG = "noise";
 static const char IDENTITY_BINDING_PREFIX[] = "bitchat-announce-v1";
@@ -372,10 +371,7 @@ static bool process_handshake(noise_session_t *session, const noise_event_t *evt
 
     NoiseBuffer message;
     noise_buffer_set_input(message, (uint8_t *)evt->payload, evt->payload_len);
-    ESP_LOGI(TAG, "conn=%u processing handshake payload len=%u", session->conn_handle, (unsigned)evt->payload_len);
-    if (evt->payload_len) {
-        ESP_LOG_BUFFER_HEXDUMP(TAG, evt->payload, evt->payload_len, ESP_LOG_INFO);
-    }
+    ESP_LOGD(TAG, "conn=%u processing handshake payload len=%u", session->conn_handle, (unsigned)evt->payload_len);
 
     uint8_t response[NOISE_MESSAGE_MAX];
     NoiseBuffer response_buf;
@@ -411,7 +407,7 @@ static bool advance_handshake(noise_session_t *session)
         int action = noise_handshakestate_get_action(session->handshake);
         switch (action) {
         case NOISE_ACTION_WRITE_MESSAGE:
-    if (!send_handshake_message(session)) {
+            if (!send_handshake_message(session)) {
                 return false;
             }
             if (noise_handshakestate_get_action(session->handshake) == NOISE_ACTION_WRITE_MESSAGE) {
@@ -758,7 +754,7 @@ static bool try_send_identity(noise_session_t *session)
     if (session->identity_sent) {
         return true;
     }
-    if (!bitchat_ble_conn_subscribed(session->conn_handle)) {
+    if (!bitle_link_ready(session->conn_handle)) {
         /* Link cannot carry notifications yet; the subscribe event or the
          * BLE watchdog will get us unstuck — stay quiet until then. */
         return false;
@@ -782,6 +778,39 @@ static bool try_send_identity(noise_session_t *session)
     session->sent_sync_gen = bitchat_time_sync_generation();
     ESP_LOGI(TAG, "conn=%u identity and announce sent", session->conn_handle);
     return true;
+}
+
+/* Session-free announce for non-BLE links (the LoRa trunk beacons with
+ * this). Reuses the exact signed padded-canonical announce the BLE path
+ * sends; key material and nickname are read-only after init, so building
+ * and signing here (the LoRa task) cannot race the noise worker. */
+bool noise_announce_link(uint16_t link_handle)
+{
+    if (!bitchat_time_is_valid()) {
+        return false;
+    }
+    uint8_t announce_payload[128];
+    size_t announce_len = 0;
+    if (!build_announce_payload(announce_payload, sizeof(announce_payload), &announce_len)) {
+        return false;
+    }
+    bitchat_packet_t packet = {0};
+    packet.version = 1;
+    packet.type = BITCHAT_MSG_ANNOUNCE;
+    packet.ttl = NOISE_PACKET_TTL;
+    packet.timestamp_ms = bitchat_time_now_ms();
+    memcpy(packet.sender_id, s_peer_id, sizeof(packet.sender_id));
+    packet.payload = announce_payload;
+    packet.payload_len = announce_len;
+    if (!sign_packet(&packet)) {
+        return false;
+    }
+    uint8_t buffer[BITCHAT_BLE_MAX_PACKET_SIZE];
+    size_t encoded_len = sizeof(buffer);
+    if (!bitchat_packet_encode(&packet, buffer, &encoded_len, sizeof(buffer))) {
+        return false;
+    }
+    return bitle_link_send(link_handle, buffer, (uint16_t)encoded_len) == ESP_OK;
 }
 
 static bool send_announce(noise_session_t *session)
@@ -822,7 +851,7 @@ static bool send_announce(noise_session_t *session)
         return false;
     }
 
-    if (bitchat_ble_send(session->conn_handle, buffer, encoded_len) != ESP_OK) {
+    if (bitle_link_send(session->conn_handle, buffer, (uint16_t)encoded_len) != ESP_OK) {
         return false;
     }
 
@@ -1129,11 +1158,9 @@ static void handle_noise_payload(uint16_t conn_handle, const noise_event_t *evt,
             memcpy(message_id, p + offset, tlv_len);
             message_id[tlv_len] = '\0';
         } else if (tlv_type == 0x01) {
-            char content[256];
-            size_t copy_len = tlv_len < sizeof(content) - 1 ? tlv_len : sizeof(content) - 1;
-            memcpy(content, p + offset, copy_len);
-            content[copy_len] = '\0';
-            ESP_LOGI(TAG, "PRIVATE message on conn=%u: %s", conn_handle, content);
+            /* Message content: never logged; the relay only needs the id
+             * (above) to acknowledge delivery. */
+            ESP_LOGD(TAG, "conn=%u private message received (%u bytes)", conn_handle, (unsigned)tlv_len);
         }
         offset += tlv_len;
     }
@@ -1202,7 +1229,7 @@ static esp_err_t encode_and_send(uint16_t conn_handle, bitchat_message_type_t ty
         return ESP_FAIL;
     }
 
-    return bitchat_ble_send(conn_handle, buffer, encoded_len);
+    return bitle_link_send(conn_handle, buffer, (uint16_t)encoded_len);
 }
 
 static esp_err_t queue_event(const noise_event_t *evt, TickType_t wait_ticks)
@@ -1636,11 +1663,8 @@ void noise_handle_public_message(uint16_t conn_handle, const bitchat_packet_t *p
     (void)conn_handle;
     char peer_hex[17];
     format_hex(packet->sender_id, sizeof(packet->sender_id), peer_hex, sizeof(peer_hex));
-    char buf[257];
-    size_t copy_len = packet->payload_len < sizeof(buf) - 1 ? packet->payload_len : sizeof(buf) - 1;
-    memcpy(buf, packet->payload, copy_len);
-    buf[copy_len] = '\0';
-    ESP_LOGI(TAG, "PLAIN message from %s: %s", peer_hex, buf);
+    /* Content is never logged; the mesh core handles any relaying. */
+    ESP_LOGD(TAG, "Public message from %s (%u bytes)", peer_hex, (unsigned)packet->payload_len);
 }
 
 void noise_reset_connection(uint16_t conn_handle)
@@ -1664,11 +1688,6 @@ const uint8_t *noise_get_local_peer_id(void)
     return s_peer_id;
 }
 
-const uint8_t *noise_get_static_public_key(void)
-{
-    return s_static_public;
-}
-
 void noise_begin_handshake(uint16_t conn_handle, const uint8_t peer_id[8], const char *nickname)
 {
     (void)nickname;
@@ -1678,12 +1697,6 @@ void noise_begin_handshake(uint16_t conn_handle, const uint8_t peer_id[8], const
         return;
     }
     enqueue_event(NOISE_EVT_START, conn_handle, peer_id, true, NULL, 0);
-}
-
-bool noise_can_begin_handshake(uint16_t conn_handle)
-{
-    noise_session_t *session = find_session(conn_handle);
-    return !(session && session->handshake);
 }
 
 bool noise_send_encrypted(uint16_t conn_handle, bitchat_noise_payload_type_t payload_type, const uint8_t *payload, size_t payload_len)
@@ -1704,14 +1717,9 @@ bool noise_send_encrypted(uint16_t conn_handle, bitchat_noise_payload_type_t pay
     size_t ciphertext_len = sizeof(ciphertext);
     if (!encrypt_payload(session, framed, payload_len + 1, ciphertext, &ciphertext_len)) {
         ESP_LOGW(TAG, "Encryption failed for conn=%u", conn_handle);
-    return false;
+        return false;
     }
     return encode_and_send(conn_handle, BITCHAT_MSG_NOISE_ENCRYPTED, session->peer_id, ciphertext, ciphertext_len, true) == ESP_OK;
-}
-
-bool noise_post_handshake_event(noise_evt_type_t type, uint16_t conn_handle, const uint8_t peer_id[8], bool initiator, const uint8_t *payload, uint16_t payload_len)
-{
-    return enqueue_event(type, conn_handle, peer_id, initiator, payload, payload_len);
 }
 
 esp_err_t noise_send_raw(uint16_t conn_handle, bitchat_message_type_t type, const uint8_t recipient[8], const uint8_t *payload, size_t payload_len)
@@ -1745,7 +1753,7 @@ esp_err_t noise_send_packet(uint16_t conn_handle, bitchat_message_type_t type, c
     if (!bitchat_packet_encode(&packet, buffer, &encoded_len, sizeof(buffer))) {
         return ESP_FAIL;
     }
-    return bitchat_ble_send(conn_handle, buffer, encoded_len);
+    return bitle_link_send(conn_handle, buffer, (uint16_t)encoded_len);
 }
 
 bool noise_get_peer_identity(uint16_t conn_handle, uint8_t noise_key[32], uint8_t sign_key[32], bool *verified)
@@ -1818,7 +1826,7 @@ static void poll_session_maintenance(void)
         if (!session->in_use) {
             continue;
         }
-        if (!bitchat_ble_conn_subscribed(session->conn_handle)) {
+        if (!bitle_link_ready(session->conn_handle)) {
             continue; /* mute link; nothing we send can arrive */
         }
         if (s_identity_pending[i]) {
@@ -1830,6 +1838,7 @@ static void poll_session_maintenance(void)
          * peer's queued private messages toward us. */
         if (session->direct_peer && session->identity_sent &&
             !session->established && !session->handshake &&
+            !bitle_link_is_broadcast(session->conn_handle) &&
             session->hs_attempts < 3 && uptime >= session->next_hs_ms) {
             session->hs_attempts++;
             session->next_hs_ms = uptime + 15000;

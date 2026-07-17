@@ -43,8 +43,6 @@ void bitle_sync_handle_request(uint16_t conn_handle, const bitchat_packet_t *pac
  * mesh history a passing phone carries. */
 void bitle_sync_tick(uint16_t conn_handle, const uint8_t peer_id[8], uint64_t uptime_ms);
 
-size_t bitle_sync_count(void);
-
 #ifdef __cplusplus
 }
 #endif

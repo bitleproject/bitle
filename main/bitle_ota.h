@@ -12,7 +12,7 @@ extern "C" {
 
 /* Monotonic firmware version. Bump on every release and pass the same
  * number to tools/sign_fw.py --version. Nodes only accept higher versions. */
-#define BITLE_FW_VERSION 4
+#define BITLE_FW_VERSION 5
 
 esp_err_t bitle_ota_init(void);
 
@@ -32,7 +32,7 @@ void bitle_ota_mark_healthy(void);
  * image and can therefore serve the image to stale peers. */
 bool bitle_ota_can_serve(void);
 
-/* True while an OTA transfer (either direction) is in flight. */
+/* True while an OTA image download is in progress on this node. */
 bool bitle_ota_busy(void);
 
 #ifdef __cplusplus

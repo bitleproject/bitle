@@ -66,10 +66,6 @@ static uint64_t read_u64_be(const uint8_t *data, size_t len, size_t *offset, boo
     return value;
 }
 
-void packet_codec_init(void)
-{
-}
-
 bool bitchat_packet_decode(const uint8_t *data, size_t len, bitchat_packet_t *out_packet)
 {
     if (!data || !out_packet || len == 0) {
@@ -220,21 +216,6 @@ bool bitchat_packet_encode(const bitchat_packet_t *packet, uint8_t *out_buf, siz
     }
 
     *out_len = offset;
-    return true;
-}
-
-bool bitchat_packet_encode_canonical(const bitchat_packet_t *packet, uint8_t *out_buf, size_t *out_len, size_t max_len)
-{
-    bitchat_packet_t canonical = *packet;
-    canonical.ttl = 0;
-    canonical.is_rsr = false;
-    canonical.has_signature = false;
-    memset(canonical.signature, 0, sizeof(canonical.signature));
-    size_t len = max_len;
-    if (!bitchat_packet_encode(&canonical, out_buf, &len, max_len)) {
-        return false;
-    }
-    *out_len = len;
     return true;
 }
 

@@ -197,9 +197,9 @@ esp_err_t bitle_store_put(const uint8_t key[BITLE_STORE_KEY_LEN],
 
     uint32_t need = sizeof(store_record_hdr_t) + payload_len;
     /* Ensure the write head sits inside an open sector with room for the
-     * record. Handles three boundary cases the naive fit-check missed: the
-     * head landing exactly on a sector start, exactly on the partition end,
-     * or a record that would straddle the sector's tail. */
+     * record. Three boundary cases matter: the head landing exactly on a
+     * sector start, exactly on the partition end, or a record that would
+     * straddle the sector's tail. */
     while (true) {
         if (s_write_off >= s_part->size) {
             esp_err_t err = open_sector(0);

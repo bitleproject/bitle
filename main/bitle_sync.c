@@ -1,4 +1,5 @@
 #include "bitle_sync.h"
+#include "bitle_link.h"
 
 #include <string.h>
 
@@ -704,6 +705,12 @@ static void send_request(uint16_t conn_handle, const uint8_t peer_id[8])
     payload[off++] = (uint8_t)(FLAG_ANNOUNCE | FLAG_MESSAGE);
     payload[off++] = (uint8_t)((FLAG_PREKEY | FLAG_GROUP) >> 8);
 
+    /* Gossip sync is a point-to-point ritual with phone peers; never fire it
+     * across the broadcast trunk (it floods the backbone and reaches no real
+     * sync partner). */
+    if (bitle_link_is_broadcast(conn_handle)) {
+        return;
+    }
     if (noise_send_packet(conn_handle, BITCHAT_MSG_REQUEST_SYNC, peer_id,
                           payload, off, 0, true) == ESP_OK) {
         ESP_LOGD(TAG, "conn=%u requestSync sent (%u known)", conn_handle, (unsigned)count);
@@ -718,17 +725,6 @@ void bitle_sync_tick(uint16_t conn_handle, const uint8_t peer_id[8], uint64_t up
     }
     peer->last_request_ms = uptime_ms ? uptime_ms : 1;
     send_request(conn_handle, peer_id);
-}
-
-size_t bitle_sync_count(void)
-{
-    size_t n = 0;
-    for (size_t i = 0; i < BITLE_SYNC_SLOTS; ++i) {
-        if (s_slots[i].in_use) {
-            n++;
-        }
-    }
-    return n;
 }
 
 esp_err_t bitle_sync_init(void)

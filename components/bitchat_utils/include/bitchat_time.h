@@ -25,10 +25,7 @@ void bitchat_time_consider_peer_announce(uint64_t peer_timestamp_ms,
 /* True when our clock traces (directly or hop-by-hop) to a phone this boot.
  * Advertised in the 0xB1 announce flag so peers can propagate it. */
 bool bitchat_time_is_authoritative(void);
-void bitchat_time_set_from_wall(uint64_t unix_ms);
 bool bitchat_time_is_valid(void);
-/* True once the clock has been synced or confirmed by a peer this boot. */
-bool bitchat_time_is_peer_synced(void);
 /* Increments on every peer sync/confirmation; lets senders detect that
  * previously announced timestamps are stale and should be re-sent. */
 uint32_t bitchat_time_sync_generation(void);

@@ -18,16 +18,15 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
-#include "bitchat_time.h"
-#include "bitle_ota.h"
-#include "bitle_sync.h"
+#include "bitle_link.h"
+#include "bitle_mesh.h"
 #include "noise_handshake.h"
 #include "packet_codec.h"
 
 #define BITLE_DEVICE_NAME "Bitle Relay"
 #define BITLE_BLE_MAX_CONNECTIONS CONFIG_BT_NIMBLE_MAX_CONNECTIONS
 
-static const char *TAG = "BLE_INIT";
+static const char *TAG = "bitchat_ble";
 
 static uint16_t s_tx_val_handle;
 static bool s_host_synced;
@@ -134,6 +133,11 @@ static ble_conn_state_t *find_conn(uint16_t conn_handle)
     return NULL;
 }
 
+/* s_connections is mutated on the NimBLE host task (alloc/drop) but read on
+ * the LoRa task via the link registry (ble_link_send_cb). This spinlock keeps
+ * a reader from ever observing a half-torn entry mid-memset. */
+static portMUX_TYPE s_conn_mux = portMUX_INITIALIZER_UNLOCKED;
+
 static ble_conn_state_t *alloc_conn(uint16_t conn_handle)
 {
     ble_conn_state_t *existing = find_conn(conn_handle);
@@ -142,9 +146,11 @@ static ble_conn_state_t *alloc_conn(uint16_t conn_handle)
     }
     for (size_t i = 0; i < BITLE_BLE_MAX_CONNECTIONS; ++i) {
         if (!s_connections[i].in_use) {
+            taskENTER_CRITICAL(&s_conn_mux);
             memset(&s_connections[i], 0, sizeof(s_connections[i]));
             s_connections[i].in_use = true;
             s_connections[i].conn_handle = conn_handle;
+            taskEXIT_CRITICAL(&s_conn_mux);
             return &s_connections[i];
         }
     }
@@ -157,7 +163,10 @@ static void drop_conn(uint16_t conn_handle)
     if (!state) {
         return;
     }
+    bitle_link_unregister(conn_handle);
+    taskENTER_CRITICAL(&s_conn_mux);
     memset(state, 0, sizeof(*state));
+    taskEXIT_CRITICAL(&s_conn_mux);
 }
 
 /* Peripheral links carry our packets as notifications; central links (other
@@ -177,297 +186,34 @@ static int link_send(ble_conn_state_t *state, const uint8_t *data, uint16_t len)
     return ble_gattc_notify_custom(state->conn_handle, s_tx_val_handle, om);
 }
 
-static void dispatch_packet(uint16_t conn_handle, const bitchat_packet_t *packet);
-
-/* --- Fragment reassembly ---------------------------------------------------
- * Phones fragment packets that exceed the link write budget (a 256-padded
- * packet does not fit ATT_MTU-3 = 253 at MTU 256), so directly connected
- * peers routinely fragment handshakes and DMs. Fragment payload layout:
- * [8B fragment ID][2B index BE][2B total BE][1B original type][chunk].
- * Reassembled bytes are the original packet's full encoding. */
-
-#define FRAG_SLOTS      2
-#define FRAG_MAX_PARTS  4
-#define FRAG_PART_MAX   250
-#define FRAG_TIMEOUT_MS 15000ULL
-
-typedef struct {
-    bool in_use;
-    uint64_t frag_id;
-    uint8_t sender[8];
-    uint16_t total;
-    uint32_t have_mask;
-    uint64_t started_ms;
-    uint16_t part_len[FRAG_MAX_PARTS];
-    uint8_t part[FRAG_MAX_PARTS][FRAG_PART_MAX];
-} frag_slot_t;
-
-static frag_slot_t s_frag_slots[FRAG_SLOTS];
-
-static void handle_fragment(uint16_t conn_handle, const bitchat_packet_t *packet)
+/* Registered with bitle_link so the mesh core can send on BLE links without
+ * knowing they are BLE. Called from the LoRa task, so snapshot the connection
+ * fields under the lock, then do the (internally thread-safe) NimBLE call
+ * outside it — never touching s_connections while teardown may be memsetting. */
+static int ble_link_send_cb(uint16_t handle, const uint8_t *data, uint16_t len)
 {
-    const uint8_t *p = packet->payload;
-    if (!p || packet->payload_len < 13) {
-        return;
-    }
-    uint64_t frag_id = 0;
-    for (int i = 0; i < 8; ++i) {
-        frag_id = (frag_id << 8) | p[i];
-    }
-    uint16_t index = ((uint16_t)p[8] << 8) | p[9];
-    uint16_t total = ((uint16_t)p[10] << 8) | p[11];
-    uint16_t chunk_len = packet->payload_len - 13;
-    if (total == 0 || index >= total || chunk_len == 0) {
-        return;
-    }
-    if (total > FRAG_MAX_PARTS || chunk_len > FRAG_PART_MAX) {
-        ESP_LOGI(TAG, "Fragment exceeds local limits (total=%u len=%u); relay-only", total, chunk_len);
-        return;
-    }
+    taskENTER_CRITICAL(&s_conn_mux);
+    ble_conn_state_t *state = find_conn(handle);
+    bool ready = state && state->subscribed;
+    bool is_central = ready && state->is_central;
+    uint16_t conn_handle = ready ? state->conn_handle : 0;
+    uint16_t remote_val = ready ? state->remote_val_handle : 0;
+    taskEXIT_CRITICAL(&s_conn_mux);
 
-    uint64_t now = esp_timer_get_time() / 1000ULL;
-    frag_slot_t *slot = NULL;
-    frag_slot_t *free_slot = NULL;
-    frag_slot_t *oldest = &s_frag_slots[0];
-    for (size_t i = 0; i < FRAG_SLOTS; ++i) {
-        frag_slot_t *s = &s_frag_slots[i];
-        if (s->in_use && now - s->started_ms > FRAG_TIMEOUT_MS) {
-            s->in_use = false;
+    if (!ready) {
+        return BLE_HS_ENOTCONN;
+    }
+    if (is_central) {
+        if (!remote_val) {
+            return BLE_HS_EINVAL;
         }
-        if (s->in_use && s->frag_id == frag_id &&
-            memcmp(s->sender, packet->sender_id, sizeof(s->sender)) == 0) {
-            slot = s;
-        } else if (!s->in_use && !free_slot) {
-            free_slot = s;
-        }
-        if (s->started_ms < oldest->started_ms) {
-            oldest = s;
-        }
+        return ble_gattc_write_no_rsp_flat(conn_handle, remote_val, data, len);
     }
-    if (!slot) {
-        slot = free_slot ? free_slot : oldest;
-        memset(slot, 0, sizeof(*slot));
-        slot->in_use = true;
-        slot->frag_id = frag_id;
-        memcpy(slot->sender, packet->sender_id, sizeof(slot->sender));
-        slot->total = total;
-        slot->started_ms = now;
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
+    if (!om) {
+        return BLE_HS_ENOMEM;
     }
-    if (slot->total != total) {
-        return;
-    }
-    slot->part_len[index] = chunk_len;
-    memcpy(slot->part[index], p + 13, chunk_len);
-    slot->have_mask |= 1u << index;
-
-    uint32_t want_mask = (1u << total) - 1;
-    if ((slot->have_mask & want_mask) != want_mask) {
-        return;
-    }
-
-    static uint8_t reassembled[FRAG_MAX_PARTS * FRAG_PART_MAX];
-    size_t reassembled_len = 0;
-    for (uint16_t i = 0; i < total; ++i) {
-        memcpy(reassembled + reassembled_len, slot->part[i], slot->part_len[i]);
-        reassembled_len += slot->part_len[i];
-    }
-    slot->in_use = false;
-
-    bitchat_packet_t inner;
-    if (!bitchat_packet_decode(reassembled, reassembled_len, &inner)) {
-        ESP_LOGW(TAG, "Failed to decode reassembled packet (%u bytes)", (unsigned)reassembled_len);
-        return;
-    }
-    ESP_LOGI(TAG, "Reassembled packet type=0x%02X len=%u from %u fragments",
-             inner.type, inner.payload_len, total);
-    if (inner.type != BITCHAT_MSG_FRAGMENT) {
-        dispatch_packet(conn_handle, &inner);
-    }
-    bitchat_packet_free(&inner);
-}
-
-static bool is_broadcast_recipient(const bitchat_packet_t *packet)
-{
-    if (!packet->has_recipient) {
-        return true;
-    }
-    for (size_t i = 0; i < sizeof(packet->recipient_id); ++i) {
-        if (packet->recipient_id[i] != 0xFF) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool is_local_recipient(const bitchat_packet_t *packet)
-{
-    return packet->has_recipient &&
-           memcmp(packet->recipient_id, noise_get_local_peer_id(), sizeof(packet->recipient_id)) == 0;
-}
-
-static void dispatch_packet(uint16_t conn_handle, const bitchat_packet_t *packet)
-{
-    ESP_LOGI(TAG, "RX conn=%u type=0x%02X len=%u ttl=%u from=%02X%02X%02X%02X to=%s%s",
-             conn_handle, packet->type, packet->payload_len, packet->ttl,
-             packet->sender_id[0], packet->sender_id[1], packet->sender_id[2], packet->sender_id[3],
-             is_broadcast_recipient(packet) ? "bcast" : (is_local_recipient(packet) ? "us" : "other"),
-             packet->is_compressed ? " (compressed)" : "");
-
-    /* Harvest wall time only from directly-connected peers (packets still at
-     * their origin TTL). Announces flow through the authoritative path (which
-     * knows the sender's infra/authority status); other direct packet types
-     * feed only the tentative path, which bootstraps a fresh clock but never
-     * makes a large post-sync correction — so a hostile relayed or replayed
-     * timestamp cannot move an established clock. */
-    if (packet->ttl == BITLE_ORIGIN_TTL && packet->type != BITCHAT_MSG_ANNOUNCE) {
-        bitchat_time_consider_peer(packet->timestamp_ms);
-    }
-
-    if (packet->is_compressed) {
-        /* No zlib inflate on this target; the relay path still forwards the
-         * raw bytes, we just cannot act on the payload locally. */
-        return;
-    }
-    if (!is_broadcast_recipient(packet) && !is_local_recipient(packet)) {
-        return; /* directed at another peer; the relay layer forwards it */
-    }
-
-    switch (packet->type) {
-    case BITCHAT_MSG_ANNOUNCE:
-        noise_handle_announce(conn_handle, packet);
-        break;
-    case BITCHAT_MSG_NOISE_HANDSHAKE:
-        noise_handle_handshake(conn_handle, packet);
-        break;
-    case BITCHAT_MSG_NOISE_ENCRYPTED:
-        noise_handle_encrypted(conn_handle, packet);
-        break;
-    case BITCHAT_MSG_NOISE_IDENTITY_ANNOUNCE:
-        noise_handle_identity_announce(conn_handle, packet);
-        break;
-    case BITCHAT_MSG_MESSAGE:
-        noise_handle_public_message(conn_handle, packet);
-        break;
-    case BITCHAT_MSG_FRAGMENT:
-        handle_fragment(conn_handle, packet);
-        break;
-    case BITLE_MSG_OTA_MANIFEST:
-    case BITLE_MSG_OTA_REQ:
-    case BITLE_MSG_OTA_CHUNK:
-    case BITLE_MSG_OTA_STATUS:
-        bitle_ota_handle_packet(conn_handle, packet);
-        break;
-    case BITCHAT_MSG_COURIER_ENVELOPE:
-        if (is_local_recipient(packet)) {
-            noise_handle_courier(conn_handle, packet);
-        }
-        break;
-    case BITCHAT_MSG_REQUEST_SYNC:
-        noise_handle_request_sync(conn_handle, packet);
-        break;
-    case BITCHAT_MSG_LEAVE:
-        break;
-    default:
-        ESP_LOGD(TAG, "Ignoring packet type 0x%02X locally", packet->type);
-        break;
-    }
-}
-
-/* --- Mesh relay -----------------------------------------------------------
- * Forwards packets between connected centrals: TTL-decremented, deduplicated
- * raw re-broadcast of everything not addressed to (or sent by) this node. */
-
-#define RELAY_CACHE_SIZE 64
-
-static uint64_t s_relay_seen[RELAY_CACHE_SIZE];
-static size_t s_relay_seen_next;
-
-static uint64_t relay_fingerprint(const uint8_t *data, size_t len)
-{
-    /* FNV-1a over the packet bytes, skipping the TTL byte (offset 2), which
-     * changes at every hop and must not defeat deduplication. */
-    uint64_t hash = 1469598103934665603ULL;
-    for (size_t i = 0; i < len; ++i) {
-        if (i == 2) {
-            continue;
-        }
-        hash ^= data[i];
-        hash *= 1099511628211ULL;
-    }
-    return hash;
-}
-
-static bool relay_seen_before(uint64_t fingerprint)
-{
-    for (size_t i = 0; i < RELAY_CACHE_SIZE; ++i) {
-        if (s_relay_seen[i] == fingerprint) {
-            return true;
-        }
-    }
-    s_relay_seen[s_relay_seen_next] = fingerprint;
-    s_relay_seen_next = (s_relay_seen_next + 1) % RELAY_CACHE_SIZE;
-    return false;
-}
-
-static void relay_packet(uint16_t src_conn, uint8_t *buffer, uint16_t len, const bitchat_packet_t *packet)
-{
-    if (packet->ttl <= 1) {
-        return;
-    }
-    if (memcmp(packet->sender_id, noise_get_local_peer_id(), sizeof(packet->sender_id)) == 0) {
-        return; /* our own packet echoed back */
-    }
-    if (packet->type == BITCHAT_MSG_REQUEST_SYNC) {
-        return; /* link-local by protocol */
-    }
-    if (is_local_recipient(packet)) {
-        return; /* addressed to us; nothing to forward */
-    }
-    if (!packet->has_recipient && packet->type == BITCHAT_MSG_NOISE_HANDSHAKE) {
-        return; /* undirected handshakes are link-local */
-    }
-
-    uint64_t fingerprint = relay_fingerprint(buffer, len);
-    if (relay_seen_before(fingerprint)) {
-        return;
-    }
-
-    buffer[2] = packet->ttl - 1;
-
-    int forwarded = 0;
-    for (size_t i = 0; i < BITLE_BLE_MAX_CONNECTIONS; ++i) {
-        ble_conn_state_t *state = &s_connections[i];
-        if (!state->in_use || !state->subscribed || state->conn_handle == src_conn) {
-            continue;
-        }
-        int rc = link_send(state, buffer, len);
-        if (rc != 0) {
-            ESP_LOGW(TAG, "Relay send failed conn=%u rc=%d", state->conn_handle, rc);
-        } else {
-            forwarded++;
-        }
-    }
-    if (forwarded > 0) {
-        ESP_LOGI(TAG, "Relayed type=0x%02X ttl=%u to %d conn(s)", packet->type, buffer[2], forwarded);
-    }
-}
-
-static bool handle_inbound(uint16_t conn_handle, uint8_t *buffer, uint16_t len)
-{
-    bitchat_packet_t packet;
-    if (!bitchat_packet_decode(buffer, len, &packet)) {
-        ESP_LOGW(TAG, "Failed to decode inbound packet len=%u", len);
-        return false;
-    }
-    dispatch_packet(conn_handle, &packet);
-    /* Dead-drop: keep recent signed public packets so passing phones can
-     * sync from us later (the module filters types and enforces budgets). */
-    if (!packet.is_compressed) {
-        bitle_sync_ingest(&packet, buffer, len);
-    }
-    relay_packet(conn_handle, buffer, len, &packet);
-    bitchat_packet_free(&packet);
-    return true;
+    return ble_gattc_notify_custom(conn_handle, s_tx_val_handle, om);
 }
 
 static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
@@ -491,7 +237,7 @@ static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         return BLE_ATT_ERR_UNLIKELY;
     }
 
-    if (!handle_inbound(conn_handle, buffer, copied)) {
+    if (!bitle_mesh_inbound(conn_handle, buffer, copied)) {
         return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     }
     return 0;
@@ -589,6 +335,7 @@ static int central_cccd_written(uint16_t conn_handle, const struct ble_gatt_erro
     state->subscribed = true;
     ESP_LOGI(TAG, "conn=%u bitle-to-bitle link ready (val_handle=%u)",
              conn_handle, state->remote_val_handle);
+    bitle_link_register(conn_handle, BITLE_LINK_BLE, ble_link_send_cb);
     noise_notify_subscribed(conn_handle);
     return 0;
 }
@@ -771,7 +518,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         uint8_t buffer[BITCHAT_BLE_MAX_PACKET_SIZE];
         uint16_t copied = 0;
         if (ble_hs_mbuf_to_flat(event->notify_rx.om, buffer, sizeof(buffer), &copied) == 0 && copied) {
-            handle_inbound(event->notify_rx.conn_handle, buffer, copied);
+            bitle_mesh_inbound(event->notify_rx.conn_handle, buffer, copied);
         }
         return 0;
     }
@@ -788,7 +535,10 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
                  event->subscribe.cur_notify,
                  event->subscribe.cur_indicate);
         if (state && state->subscribed && !was_subscribed) {
+            bitle_link_register(event->subscribe.conn_handle, BITLE_LINK_BLE, ble_link_send_cb);
             noise_notify_subscribed(event->subscribe.conn_handle);
+        } else if (state && !state->subscribed && was_subscribed) {
+            bitle_link_unregister(event->subscribe.conn_handle);
         }
         return 0;
     }
@@ -946,12 +696,6 @@ void bitchat_ble_disconnect(uint16_t conn_handle)
     ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
 }
 
-bool bitchat_ble_conn_subscribed(uint16_t conn_handle)
-{
-    ble_conn_state_t *state = find_conn(conn_handle);
-    return state && state->subscribed;
-}
-
 esp_err_t bitchat_ble_send(uint16_t conn_handle, const uint8_t *data, size_t len)
 {
     if (!data || len == 0 || len > BITCHAT_BLE_MAX_PACKET_SIZE) {
@@ -969,37 +713,6 @@ esp_err_t bitchat_ble_send(uint16_t conn_handle, const uint8_t *data, size_t len
     int rc = link_send(state, data, (uint16_t)len);
     if (rc != 0) {
         ESP_LOGW(TAG, "send failed conn=%u rc=%d", conn_handle, rc);
-        return ESP_FAIL;
-    }
-    return ESP_OK;
-}
-
-esp_err_t bitchat_ble_send_with_ack(uint16_t conn_handle, const uint8_t *data, size_t len)
-{
-    if (!data || len == 0 || len > BITCHAT_BLE_MAX_PACKET_SIZE) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (!s_host_synced) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    ble_conn_state_t *state = find_conn(conn_handle);
-    if (!state || !state->subscribed) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    int rc;
-    if (state->is_central) {
-        rc = ble_gattc_write_no_rsp_flat(conn_handle, state->remote_val_handle, data, (uint16_t)len);
-    } else {
-        struct os_mbuf *om = ble_hs_mbuf_from_flat(data, (uint16_t)len);
-        if (!om) {
-            return ESP_ERR_NO_MEM;
-        }
-        rc = ble_gatts_indicate_custom(conn_handle, s_tx_val_handle, om);
-    }
-    if (rc != 0) {
-        ESP_LOGW(TAG, "indicate failed conn=%u rc=%d", conn_handle, rc);
         return ESP_FAIL;
     }
     return ESP_OK;

@@ -451,11 +451,6 @@ bool bitle_courier_accept(uint16_t conn_handle, const uint8_t depositor[8],
     return true;
 }
 
-size_t bitle_courier_count(void)
-{
-    return bitle_store_count();
-}
-
 esp_err_t bitle_courier_init(void)
 {
     memset(s_side, 0, sizeof(s_side));

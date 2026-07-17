@@ -24,9 +24,9 @@ void noise_rand_bytes(void *bytes, size_t size)
     }
 }
 
-#ifdef ED25519_CUSTOMRANDOM
+/* ed25519.c is built with -DED25519_CUSTOMRANDOM (see CMakeLists.txt) and
+ * expects this symbol for batch verification. */
 void ed25519_randombytes_unsafe(void *p, size_t len)
 {
     noise_rand_bytes(p, len);
 }
-#endif
